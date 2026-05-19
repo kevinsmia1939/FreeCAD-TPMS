@@ -1,0 +1,23 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# FreeCAD generated documents and backups
+*.FCStd
+*.FCBak
+*.FCStd1
+
+# Generated mesh outputs and local sample meshes
+*.stl
+*.obj
+*.ply
+*.off
+*.mesh
+
+# Local temporary/test outputs
+tmp/
+temp/
+*.log
+
+# Bundled external reference checkout, if kept locally
+blender-tpms-main/
