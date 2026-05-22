@@ -91,7 +91,7 @@ def configure_vtk_smp():
 
 
 def boundary_modes():
-    return [BOUNDARY_BOX, BOUNDARY_SPHERE, BOUNDARY_SELECTED_SOLID]
+    return [BOUNDARY_BOX, BOUNDARY_SELECTED_SOLID]
 
 
 def _make_axis(minimum, maximum, default_count):
@@ -121,11 +121,28 @@ def _shape_bounds(boundary_object):
     )
 
 
-def _make_grid(cell_size, repeat_cell, resolution, phase, boundary_mode=BOUNDARY_BOX, boundary_object=None, sampling=0.0):
+def _make_grid(
+    cell_size,
+    repeat_cell,
+    resolution,
+    phase,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    origin=None,
+    origin_rotation=None,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
+):
     cell_size = np.asarray(cell_size, dtype=float)
     repeat_cell = np.asarray(repeat_cell, dtype=int)
     repeat_cell = np.maximum(repeat_cell, 1)
     phase = np.asarray(phase, dtype=float)
+
+    if origin is None:
+        origin = _default_origin(boundary_mode, boundary_object)
+    phase_origin = np.asarray(origin, dtype=float)
 
     if boundary_mode == BOUNDARY_SELECTED_SOLID:
         bounds = _shape_bounds(boundary_object)
@@ -137,8 +154,7 @@ def _make_grid(cell_size, repeat_cell, resolution, phase, boundary_mode=BOUNDARY
         ]
     else:
         domain_size = cell_size * repeat_cell
-        half = 0.5 * domain_size
-        bounds = [(-half[i], half[i]) for i in range(3)]
+        bounds = [(phase_origin[i], phase_origin[i] + domain_size[i]) for i in range(3)]
         default_counts = [int(resolution) * int(repeat_cell[i]) + 1 for i in range(3)]
 
     if sampling and sampling > 0.0:
@@ -152,14 +168,67 @@ def _make_grid(cell_size, repeat_cell, resolution, phase, boundary_mode=BOUNDARY
         float(coords[i][1] - coords[i][0]) if len(coords[i]) > 1 else 1.0
         for i in range(3)
     )
-    origin = tuple(float(coords[i][0]) for i in range(3))
-    grid = pv.ImageData(dimensions=tuple(default_counts), spacing=spacing, origin=origin)
+    grid_origin = tuple(float(coords[i][0]) for i in range(3))
+    grid = pv.ImageData(dimensions=tuple(default_counts), spacing=spacing, origin=grid_origin)
 
+    rotation_matrix = _rotation_matrix(origin_rotation, boundary_object)
+    if rotation_matrix is not None:
+        tx, ty, tz = _world_to_origin_frame_arrays(rotation_matrix, wx, wy, wz, phase_origin)
+    else:
+        tx = wx - phase_origin[0]
+        ty = wy - phase_origin[1]
+        tz = wz - phase_origin[2]
+
+    density = _density_multiplier(wx, wy, wz, density_mode, base_density, density_controls)
     kx, ky, kz = [2.0 * math.pi / max(cell_size[i], 1e-9) for i in range(3)]
-    sx = kx * (wx + phase[0])
-    sy = ky * (wy + phase[1])
-    sz = kz * (wz + phase[2])
+    sx = kx * (tx + phase[0]) * density
+    sy = ky * (ty + phase[1]) * density
+    sz = kz * (tz + phase[2]) * density
     return grid, sx, sy, sz, wx, wy, wz
+
+
+def _default_origin(boundary_mode, boundary_object):
+    if boundary_mode == BOUNDARY_SELECTED_SOLID and boundary_object is not None:
+        placement = getattr(boundary_object, "Placement", None)
+        if placement is not None:
+            base = placement.Base
+            return (float(base.x), float(base.y), float(base.z))
+        try:
+            bounds = _shape_bounds(boundary_object)
+            return tuple(float(bounds[i][0]) for i in range(3))
+        except Exception:
+            pass
+    return (0.0, 0.0, 0.0)
+
+
+def _density_multiplier(wx, wy, wz, density_mode="Uniform", base_density=1.0, density_controls=None):
+    base = max(0.05, float(base_density))
+    density = np.full(wx.shape, base, dtype=float)
+    if str(density_mode) != "Non-uniform" or not density_controls:
+        return density
+
+    for control in density_controls:
+        try:
+            point = np.asarray(control["point"], dtype=float)
+            normal = np.asarray(control["normal"], dtype=float)
+            target = max(0.05, float(control["density"]))
+            transition = max(1e-9, float(control["transition"]))
+        except Exception:
+            continue
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-12:
+            continue
+        normal = normal / norm
+        distance = np.abs(
+            (wx - point[0]) * normal[0]
+            + (wy - point[1]) * normal[1]
+            + (wz - point[2]) * normal[2]
+        )
+        t = np.clip(distance / transition, 0.0, 1.0)
+        smooth = t * t * (3.0 - 2.0 * t)
+        weight = 1.0 - smooth
+        density += weight * (target - base)
+    return np.maximum(density, 0.05)
 
 
 def _selected_solid_field(shape, wx, wy, wz, tolerance):
@@ -349,6 +418,10 @@ def _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object=None, s
     elif boundary_mode == BOUNDARY_SELECTED_SOLID:
         if boundary_object is None:
             raise ValueError("Selected boundary needs a linked solid or mesh object")
+        field = _analytic_boundary_field(boundary_object, wx, wy, wz)
+        if field is not None:
+            grid["boundary"] = field.ravel(order="F")
+            return True
         try:
             fallback_resolution = max(wx.shape)
             field = _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution)
@@ -369,6 +442,98 @@ def _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object=None, s
 
     grid["boundary"] = field.ravel(order="F")
     return True
+
+
+def _analytic_boundary_field(boundary_object, wx, wy, wz):
+    type_id = getattr(boundary_object, "TypeId", "")
+    placement = getattr(boundary_object, "Placement", None)
+    if placement is None:
+        return None
+
+    if type_id == "Part::Sphere" and hasattr(boundary_object, "Radius"):
+        radius = float(boundary_object.Radius)
+        lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+        return radius - np.sqrt(lx * lx + ly * ly + lz * lz)
+
+    if _is_part_box(boundary_object):
+        length = float(boundary_object.Length)
+        width = float(boundary_object.Width)
+        height = float(boundary_object.Height)
+        lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+        inside_distance = np.minimum.reduce((lx, length - lx, ly, width - ly, lz, height - lz))
+        outside = np.sqrt(
+            np.maximum(-lx, 0.0) ** 2
+            + np.maximum(lx - length, 0.0) ** 2
+            + np.maximum(-ly, 0.0) ** 2
+            + np.maximum(ly - width, 0.0) ** 2
+            + np.maximum(-lz, 0.0) ** 2
+            + np.maximum(lz - height, 0.0) ** 2
+        )
+        return np.where(inside_distance >= 0.0, inside_distance, -outside)
+
+    return None
+
+
+def _is_part_box(boundary_object):
+    return (
+        getattr(boundary_object, "TypeId", "") == "Part::Box"
+        and all(hasattr(boundary_object, name) for name in ("Length", "Width", "Height"))
+    )
+
+
+def _world_to_local_arrays(placement, wx, wy, wz):
+    inverse = placement.inverse()
+    matrix = inverse.Matrix
+    lx = matrix.A11 * wx + matrix.A12 * wy + matrix.A13 * wz + matrix.A14
+    ly = matrix.A21 * wx + matrix.A22 * wy + matrix.A23 * wz + matrix.A24
+    lz = matrix.A31 * wx + matrix.A32 * wy + matrix.A33 * wz + matrix.A34
+    return lx, ly, lz
+
+
+def _rotation_matrix(origin_rotation, boundary_object=None):
+    if isinstance(origin_rotation, bool):
+        if origin_rotation and _is_part_box(boundary_object):
+            return _freecad_rotation_matrix(boundary_object.Placement.Rotation)
+        return None
+    if origin_rotation is None:
+        return None
+    if hasattr(origin_rotation, "toMatrix"):
+        return _freecad_rotation_matrix(origin_rotation)
+    try:
+        rx, ry, rz = [math.radians(float(value)) for value in origin_rotation]
+    except Exception:
+        return None
+
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    mx = np.array(((1.0, 0.0, 0.0), (0.0, cx, -sx), (0.0, sx, cx)), dtype=float)
+    my = np.array(((cy, 0.0, sy), (0.0, 1.0, 0.0), (-sy, 0.0, cy)), dtype=float)
+    mz = np.array(((cz, -sz, 0.0), (sz, cz, 0.0), (0.0, 0.0, 1.0)), dtype=float)
+    return mz @ my @ mx
+
+
+def _freecad_rotation_matrix(rotation):
+    matrix = rotation.toMatrix()
+    return np.array(
+        (
+            (float(matrix.A11), float(matrix.A12), float(matrix.A13)),
+            (float(matrix.A21), float(matrix.A22), float(matrix.A23)),
+            (float(matrix.A31), float(matrix.A32), float(matrix.A33)),
+        ),
+        dtype=float,
+    )
+
+
+def _world_to_origin_frame_arrays(rotation_matrix, wx, wy, wz, origin):
+    inverse = rotation_matrix.T
+    dx = wx - float(origin[0])
+    dy = wy - float(origin[1])
+    dz = wz - float(origin[2])
+    tx = inverse[0, 0] * dx + inverse[0, 1] * dy + inverse[0, 2] * dz
+    ty = inverse[1, 0] * dx + inverse[1, 1] * dy + inverse[1, 2] * dz
+    tz = inverse[2, 0] * dx + inverse[2, 1] * dy + inverse[2, 2] * dz
+    return tx, ty, tz
 
 
 def _apply_boundary_clip(volume, has_boundary):
@@ -424,6 +589,11 @@ def generate_polydata(
     boundary_object=None,
     sampling=0.0,
     add_caps=True,
+    origin=None,
+    origin_rotation=None,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
 ):
     configure_vtk_smp()
     grid, x, y, z, wx, wy, wz = _make_grid(
@@ -434,6 +604,11 @@ def generate_polydata(
         boundary_mode,
         boundary_object,
         sampling,
+        origin,
+        origin_rotation,
+        density_mode,
+        base_density,
+        density_controls,
     )
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
@@ -695,6 +870,11 @@ def generate_freecad_mesh(
     relax_iterations=5,
     relax_skip_boundary=True,
     relax_cap_surface=False,
+    origin=None,
+    origin_rotation=None,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
 ):
     repeat_cell = tuple(max(1, int(value)) for value in repeat_cell)
     cell_size = tuple(float(value) for value in cell_size)
@@ -712,6 +892,11 @@ def generate_freecad_mesh(
             boundary_object,
             sampling,
             add_caps,
+            origin,
+            origin_rotation,
+            density_mode,
+            base_density,
+            density_controls,
         )
         return _prepare_freecad_mesh(
             polydata,
@@ -735,8 +920,13 @@ def generate_freecad_mesh(
             boundary_object,
             sampling,
             add_caps,
+            origin,
+            origin_rotation,
+            density_mode,
+            base_density,
+            density_controls,
         )
-        return _prepare_freecad_mesh(
+        mesh = _prepare_freecad_mesh(
             polydata,
             mesh_relaxation,
             relax_iterations,
@@ -744,6 +934,7 @@ def generate_freecad_mesh(
             relax_cap_surface,
             add_caps,
         )
+        return mesh
 
     polydata = generate_polydata(
         equation,
@@ -757,6 +948,11 @@ def generate_freecad_mesh(
         boundary_object,
         sampling,
         add_caps,
+        origin,
+        origin_rotation,
+        density_mode,
+        base_density,
+        density_controls,
     )
     unit_mesh = _prepare_freecad_mesh(
         polydata,
@@ -807,6 +1003,11 @@ def add_tpms_mesh_to_document(
     relax_iterations=5,
     relax_skip_boundary=True,
     relax_cap_surface=False,
+    origin=None,
+    origin_rotation=None,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
     label="TPMS unit cell",
 ):
     if App.ActiveDocument is None:
@@ -830,6 +1031,11 @@ def add_tpms_mesh_to_document(
         relax_iterations,
         relax_skip_boundary,
         relax_cap_surface,
+        origin,
+        origin_rotation,
+        density_mode,
+        base_density,
+        density_controls,
     )
 
     obj = doc.addObject("Mesh::Feature", "TPMS_Unit_Cell")
@@ -850,6 +1056,10 @@ def add_tpms_mesh_to_document(
     obj.addProperty("App::PropertyInteger", "RelaxIterations", "Relaxation", "Lloyd-style relaxation iterations")
     obj.addProperty("App::PropertyBool", "RelaxSkipBoundary", "Relaxation", "Keep boundary/cap vertices fixed during relaxation")
     obj.addProperty("App::PropertyBool", "RelaxCapSurface", "Relaxation", "Allow cap vertices to relax tangentially while keeping seam fixed")
+    obj.addProperty("App::PropertyVector", "Origin", "TPMS", "TPMS phase origin")
+    obj.addProperty("App::PropertyVector", "OriginRotation", "TPMS", "TPMS origin-frame rotation in XYZ degrees")
+    obj.addProperty("App::PropertyString", "DensityMode", "Density", "Density control mode")
+    obj.addProperty("App::PropertyFloat", "BaseDensity", "Density", "Base TPMS density multiplier")
     obj.ImplicitEquation = equation
     obj.TPMSPart = part
     obj.Resolution = int(resolution)
@@ -865,5 +1075,14 @@ def add_tpms_mesh_to_document(
     obj.RelaxIterations = int(relax_iterations)
     obj.RelaxSkipBoundary = bool(relax_skip_boundary)
     obj.RelaxCapSurface = bool(relax_cap_surface)
+    obj.DensityMode = str(density_mode)
+    obj.BaseDensity = float(base_density)
+    if origin is not None:
+        obj.Origin = App.Vector(float(origin[0]), float(origin[1]), float(origin[2]))
+    if origin_rotation is not None and not hasattr(origin_rotation, "toMatrix"):
+        try:
+            obj.OriginRotation = App.Vector(float(origin_rotation[0]), float(origin_rotation[1]), float(origin_rotation[2]))
+        except Exception:
+            pass
     doc.recompute()
     return obj
