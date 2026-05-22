@@ -24,13 +24,21 @@ def make_tpms_unit_cell(doc=None):
     controller.Surface = "Gyroid"
     controller.Part = tpms_generator.PART_SHEET
     controller.Equation = tpms_generator.SURFACE_EQUATIONS["Gyroid"]
-    controller.Resolution = 32
+    controller.Resolution = 16
     controller.RepeatX = 1
     controller.RepeatY = 1
     controller.RepeatZ = 1
     controller.Offset = 0.3
-    controller.CellSize = App.Vector(1.0, 1.0, 1.0)
+    controller.CellSize = App.Vector(10.0, 10.0, 10.0)
     controller.Phase = App.Vector(0.0, 0.0, 0.0)
+    controller.MeshStitching = False
+    controller.BoundaryMode = tpms_generator.BOUNDARY_BOX
+    controller.Sampling = 0.0
+    controller.AddCaps = True
+    controller.MeshRelaxation = False
+    controller.RelaxIterations = 5
+    controller.RelaxSkipBoundary = True
+    controller.RelaxCapSurface = False
 
     doc.recompute()
     return container, controller, mesh_obj
@@ -68,6 +76,32 @@ class TPMSUnitCell:
             obj.addProperty("App::PropertyVector", "CellSize", "TPMS", "Unit-cell size in X/Y/Z")
         if not hasattr(obj, "Phase"):
             obj.addProperty("App::PropertyVector", "Phase", "TPMS", "Phase shift in document units")
+        if not hasattr(obj, "MeshStitching"):
+            obj.addProperty("App::PropertyBool", "MeshStitching", "TPMS Array", "Stitch repeated mesh boundaries")
+            obj.MeshStitching = False
+        if not hasattr(obj, "BoundaryMode"):
+            obj.addProperty("App::PropertyEnumeration", "BoundaryMode", "Boundary", "Boundary used to clip the generated TPMS")
+            obj.BoundaryMode = tpms_generator.boundary_modes()
+        if not hasattr(obj, "BoundaryObject"):
+            obj.addProperty("App::PropertyXLink", "BoundaryObject", "Boundary", "Selected solid or mesh used as boundary")
+        if not hasattr(obj, "Sampling"):
+            obj.addProperty("App::PropertyFloat", "Sampling", "Boundary", "Target grid resolution along the longest sampled axis; 0 uses Resolution")
+            obj.Sampling = 0.0
+        if not hasattr(obj, "AddCaps"):
+            obj.addProperty("App::PropertyBool", "AddCaps", "Boundary", "Add caps where TPMS intersects the boundary")
+            obj.AddCaps = True
+        if not hasattr(obj, "MeshRelaxation"):
+            obj.addProperty("App::PropertyBool", "MeshRelaxation", "Relaxation", "Apply Lloyd-style mesh relaxation")
+            obj.MeshRelaxation = False
+        if not hasattr(obj, "RelaxIterations"):
+            obj.addProperty("App::PropertyInteger", "RelaxIterations", "Relaxation", "Lloyd-style relaxation iterations")
+            obj.RelaxIterations = 5
+        if not hasattr(obj, "RelaxSkipBoundary"):
+            obj.addProperty("App::PropertyBool", "RelaxSkipBoundary", "Relaxation", "Keep boundary/cap vertices fixed during relaxation")
+            obj.RelaxSkipBoundary = True
+        if not hasattr(obj, "RelaxCapSurface"):
+            obj.addProperty("App::PropertyBool", "RelaxCapSurface", "Relaxation", "Allow cap vertices to relax tangentially while keeping seam fixed")
+            obj.RelaxCapSurface = False
         if not hasattr(obj, "ResultMesh"):
             obj.addProperty("App::PropertyLink", "ResultMesh", "TPMS", "Generated mesh object")
         if not hasattr(obj, "FacetCount"):
@@ -111,9 +145,9 @@ class TPMSUnitCell:
                 max(1, int(obj.RepeatY)),
                 max(1, int(obj.RepeatZ)),
             )
-            cell_size = _vector_tuple(obj.CellSize, fallback=(1.0, 1.0, 1.0), minimum=1e-9)
+            cell_size = _vector_tuple(obj.CellSize, fallback=(10.0, 10.0, 10.0), minimum=1e-9)
             phase = _vector_tuple(obj.Phase, fallback=(0.0, 0.0, 0.0), minimum=None)
-            polydata = tpms_generator.generate_polydata(
+            mesh = tpms_generator.generate_freecad_mesh(
                 obj.Equation,
                 str(obj.Part),
                 cell_size,
@@ -121,8 +155,16 @@ class TPMSUnitCell:
                 resolution,
                 float(obj.Offset),
                 phase,
+                bool(getattr(obj, "MeshStitching", False)),
+                str(getattr(obj, "BoundaryMode", tpms_generator.BOUNDARY_BOX)),
+                getattr(obj, "BoundaryObject", None),
+                max(0.0, float(getattr(obj, "Sampling", 0.0))),
+                bool(getattr(obj, "AddCaps", True)),
+                bool(getattr(obj, "MeshRelaxation", False)),
+                max(0, int(getattr(obj, "RelaxIterations", 5))),
+                bool(getattr(obj, "RelaxSkipBoundary", True)),
+                bool(getattr(obj, "RelaxCapSurface", False)),
             )
-            mesh = tpms_generator.polydata_to_freecad_mesh(polydata)
         except Exception as exc:
             obj.LastError = str(exc)
             App.Console.PrintError("TPMS generation failed: {}\n".format(exc))
@@ -148,6 +190,17 @@ class TPMSUnitCellViewProvider:
 
     def attach(self, view_obj):
         self.Object = view_obj.Object
+
+    def doubleClicked(self, view_obj):
+        try:
+            import FreeCADGui as Gui
+            from ui.task_tpms import TPMSTaskPanel
+
+            Gui.Control.showDialog(TPMSTaskPanel(view_obj.Object))
+            return True
+        except Exception as exc:
+            App.Console.PrintError("Unable to open TPMS task panel: {}\n".format(exc))
+            return False
 
     def dumps(self):
         return None

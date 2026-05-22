@@ -1,9 +1,12 @@
 import math
+import os
+import warnings
 
 import FreeCAD as App
 import Mesh
 import numpy as np
 import pyvista as pv
+import vtk
 
 
 SURFACE_EQUATIONS = {
@@ -21,6 +24,15 @@ PART_SHEET = "Sheet"
 PART_UPPER = "Upper skeletal"
 PART_LOWER = "Lower skeletal"
 PART_SURFACE = "Zero surface"
+
+BOUNDARY_BOX = "Box"
+BOUNDARY_SPHERE = "Sphere"
+BOUNDARY_SELECTED_SOLID = "Selected solid"
+
+_BOUNDARY_FIELD_CACHE = {}
+_BOUNDARY_FIELD_CACHE_ORDER = []
+_BOUNDARY_FIELD_CACHE_LIMIT = 8
+_VTK_SMP_CONFIGURED = False
 
 
 SAFE_NAMES = {
@@ -56,25 +68,348 @@ def evaluate_equation(equation, x, y, z):
     return eval(equation, {"__builtins__": {}}, namespace)
 
 
-def _make_grid(cell_size, repeat_cell, resolution, phase):
+def configure_vtk_smp():
+    global _VTK_SMP_CONFIGURED
+    if _VTK_SMP_CONFIGURED:
+        return
+    _VTK_SMP_CONFIGURED = True
+
+    requested = os.environ.get("TPMS_VTK_SMP_BACKEND") or os.environ.get("VTK_SMP_BACKEND_IN_USE")
+    candidates = [requested] if requested else ["STDThread"]
+
+    for backend in candidates:
+        if not backend:
+            continue
+        try:
+            if vtk.vtkSMPTools.SetBackend(backend):
+                max_threads = os.environ.get("TPMS_VTK_MAX_THREADS") or os.environ.get("VTK_SMP_MAX_THREADS")
+                if max_threads:
+                    vtk.vtkSMPTools.Initialize(max(1, int(max_threads)))
+                return
+        except Exception as exc:
+            App.Console.PrintWarning("Unable to configure VTK SMP backend '{}': {}\n".format(backend, exc))
+
+
+def boundary_modes():
+    return [BOUNDARY_BOX, BOUNDARY_SPHERE, BOUNDARY_SELECTED_SOLID]
+
+
+def _make_axis(minimum, maximum, default_count):
+    count = max(2, int(default_count))
+    return np.linspace(float(minimum), float(maximum), count)
+
+
+def _shape_bounds(boundary_object):
+    if boundary_object is None:
+        raise ValueError("Selected boundary needs a linked solid or mesh object")
+    if hasattr(boundary_object, "Shape"):
+        shape = boundary_object.Shape
+        if shape.isNull():
+            raise ValueError("Selected solid boundary shape is empty")
+        bb = shape.BoundBox
+    elif hasattr(boundary_object, "Mesh"):
+        mesh = boundary_object.Mesh
+        if mesh.CountFacets == 0:
+            raise ValueError("Selected mesh boundary is empty")
+        bb = mesh.BoundBox
+    else:
+        raise ValueError("Selected boundary needs a linked solid or mesh object")
+    return (
+        (float(bb.XMin), float(bb.XMax)),
+        (float(bb.YMin), float(bb.YMax)),
+        (float(bb.ZMin), float(bb.ZMax)),
+    )
+
+
+def _make_grid(cell_size, repeat_cell, resolution, phase, boundary_mode=BOUNDARY_BOX, boundary_object=None, sampling=0.0):
     cell_size = np.asarray(cell_size, dtype=float)
     repeat_cell = np.asarray(repeat_cell, dtype=int)
     repeat_cell = np.maximum(repeat_cell, 1)
     phase = np.asarray(phase, dtype=float)
-    domain_size = cell_size * repeat_cell
-    half = 0.5 * domain_size
-    coords = [
-        np.linspace(-half[i], half[i], int(resolution) * int(repeat_cell[i]) + 1)
+
+    if boundary_mode == BOUNDARY_SELECTED_SOLID:
+        bounds = _shape_bounds(boundary_object)
+        fallback_spacing = min(float(value) / max(int(resolution), 1) for value in cell_size)
+        spacing = max(fallback_spacing, 1e-9)
+        default_counts = [
+            int(math.ceil(max(bounds[i][1] - bounds[i][0], 1e-9) / spacing)) + 1
+            for i in range(3)
+        ]
+    else:
+        domain_size = cell_size * repeat_cell
+        half = 0.5 * domain_size
+        bounds = [(-half[i], half[i]) for i in range(3)]
+        default_counts = [int(resolution) * int(repeat_cell[i]) + 1 for i in range(3)]
+
+    if sampling and sampling > 0.0:
+        lengths = [max(bounds[i][1] - bounds[i][0], 1e-9) for i in range(3)]
+        spacing = max(lengths) / max(float(sampling), 1.0)
+        default_counts = [int(math.ceil(length / spacing)) + 1 for length in lengths]
+
+    coords = [_make_axis(bounds[i][0], bounds[i][1], default_counts[i]) for i in range(3)]
+    wx, wy, wz = np.meshgrid(*coords, indexing="ij")
+    spacing = tuple(
+        float(coords[i][1] - coords[i][0]) if len(coords[i]) > 1 else 1.0
         for i in range(3)
-    ]
-    x, y, z = np.meshgrid(*coords, indexing="ij")
-    grid = pv.StructuredGrid(x, y, z)
+    )
+    origin = tuple(float(coords[i][0]) for i in range(3))
+    grid = pv.ImageData(dimensions=tuple(default_counts), spacing=spacing, origin=origin)
 
     kx, ky, kz = [2.0 * math.pi / max(cell_size[i], 1e-9) for i in range(3)]
-    sx = kx * (x + phase[0])
-    sy = ky * (y + phase[1])
-    sz = kz * (z + phase[2])
-    return grid, sx, sy, sz
+    sx = kx * (wx + phase[0])
+    sy = ky * (wy + phase[1])
+    sz = kz * (wz + phase[2])
+    return grid, sx, sy, sz, wx, wy, wz
+
+
+def _selected_solid_field(shape, wx, wy, wz, tolerance):
+    values = np.empty(wx.shape, dtype=float)
+    flat_x = wx.ravel(order="C")
+    flat_y = wy.ravel(order="C")
+    flat_z = wz.ravel(order="C")
+    flat_values = values.ravel(order="C")
+    inside_value = max(float(tolerance), 1e-6)
+    for i, (x, y, z) in enumerate(zip(flat_x, flat_y, flat_z)):
+        point = App.Vector(float(x), float(y), float(z))
+        flat_values[i] = inside_value if shape.isInside(point, tolerance, True) else -inside_value
+    return values
+
+
+def _shape_to_polydata(shape, deflection):
+    points, triangles = shape.tessellate(float(deflection))
+    if not points or not triangles:
+        raise ValueError("Selected solid boundary could not be tessellated")
+
+    point_array = np.array([[point.x, point.y, point.z] for point in points], dtype=float)
+    face_array = np.empty(len(triangles) * 4, dtype=np.int64)
+    face_array[0::4] = 3
+    for index, triangle in enumerate(triangles):
+        base = index * 4
+        face_array[base + 1 : base + 4] = triangle
+    return pv.PolyData(point_array, face_array).triangulate().clean()
+
+
+def _mesh_to_polydata(mesh):
+    points, triangles = mesh.Topology
+    if not points or not triangles:
+        raise ValueError("Selected mesh boundary is empty")
+
+    point_array = np.array([[point.x, point.y, point.z] for point in points], dtype=float)
+    face_array = np.empty(len(triangles) * 4, dtype=np.int64)
+    face_array[0::4] = 3
+    for index, triangle in enumerate(triangles):
+        base = index * 4
+        face_array[base + 1 : base + 4] = triangle
+    return pv.PolyData(point_array, face_array).triangulate().clean()
+
+
+def _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    if hasattr(boundary_object, "Mesh"):
+        return _mesh_to_polydata(boundary_object.Mesh)
+    if hasattr(boundary_object, "Shape"):
+        lengths = (
+            float(np.max(wx)) - float(np.min(wx)),
+            float(np.max(wy)) - float(np.min(wy)),
+            float(np.max(wz)) - float(np.min(wz)),
+        )
+        max_length = max(max(lengths), 1e-9)
+        resolution = float(sampling) if sampling and sampling > 0.0 else float(fallback_resolution)
+        deflection = max_length / max(resolution * 2.0, 8.0)
+        return _shape_to_polydata(boundary_object.Shape, deflection)
+    raise ValueError("Selected boundary needs a linked solid or mesh object")
+
+
+def _selected_boundary_field_binary_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
+    inside = _classify_points(surface, points)
+    return np.where(inside.reshape(wx.shape, order="C"), 1.0, -1.0)
+
+
+def _classify_points(surface, points):
+    cloud = pv.PolyData(points)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        selected = cloud.select_enclosed_points(surface, tolerance=0.0, check_surface=False)
+    return np.asarray(selected["SelectedPoints"], dtype=bool)
+
+
+def _implicit_distances(surface, points):
+    cloud = pv.PolyData(points)
+    sampled = cloud.compute_implicit_distance(surface, inplace=False)
+    return np.asarray(sampled["implicit_distance"], dtype=float)
+
+
+def _boundary_shell_mask(inside):
+    mask = np.zeros(inside.shape, dtype=bool)
+    for axis in range(3):
+        lower = [slice(None)] * 3
+        upper = [slice(None)] * 3
+        lower[axis] = slice(0, -1)
+        upper[axis] = slice(1, None)
+        diff = inside[tuple(lower)] != inside[tuple(upper)]
+        mask[tuple(lower)] |= diff
+        mask[tuple(upper)] |= diff
+    return mask
+
+
+def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    cache_key = _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, "signed")
+    if cache_key is not None and cache_key in _BOUNDARY_FIELD_CACHE:
+        return _BOUNDARY_FIELD_CACHE[cache_key].copy()
+
+    surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
+    inside = _classify_points(surface, points).reshape(wx.shape, order="C")
+    shell = _boundary_shell_mask(inside)
+
+    spacing = min(
+        _axis_spacing(wx, axis=0),
+        _axis_spacing(wy, axis=1),
+        _axis_spacing(wz, axis=2),
+    )
+    field = np.where(inside, spacing, -spacing).astype(float)
+    if np.any(shell):
+        shell_points = np.column_stack((wx[shell], wy[shell], wz[shell]))
+        signed_distance = _implicit_distances(surface, shell_points)
+        field[shell] = -signed_distance
+    _store_boundary_field_cache(cache_key, field)
+    return field
+
+
+def _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, mode):
+    if boundary_object is None or not hasattr(boundary_object, "Shape"):
+        return None
+    shape = boundary_object.Shape
+    try:
+        shape_hash = int(shape.hashCode())
+    except Exception:
+        return None
+    bb = shape.BoundBox
+    return (
+        mode,
+        shape_hash,
+        round(float(bb.XMin), 9),
+        round(float(bb.XMax), 9),
+        round(float(bb.YMin), 9),
+        round(float(bb.YMax), 9),
+        round(float(bb.ZMin), 9),
+        round(float(bb.ZMax), 9),
+        tuple(int(value) for value in wx.shape),
+        round(float(np.min(wx)), 9),
+        round(float(np.max(wx)), 9),
+        round(float(np.min(wy)), 9),
+        round(float(np.max(wy)), 9),
+        round(float(np.min(wz)), 9),
+        round(float(np.max(wz)), 9),
+        round(float(sampling), 9),
+        int(fallback_resolution),
+    )
+
+
+def _store_boundary_field_cache(cache_key, field):
+    if cache_key is None:
+        return
+    if cache_key in _BOUNDARY_FIELD_CACHE:
+        _BOUNDARY_FIELD_CACHE[cache_key] = field.copy()
+        return
+    _BOUNDARY_FIELD_CACHE[cache_key] = field.copy()
+    _BOUNDARY_FIELD_CACHE_ORDER.append(cache_key)
+    while len(_BOUNDARY_FIELD_CACHE_ORDER) > _BOUNDARY_FIELD_CACHE_LIMIT:
+        oldest = _BOUNDARY_FIELD_CACHE_ORDER.pop(0)
+        _BOUNDARY_FIELD_CACHE.pop(oldest, None)
+
+
+def _axis_spacing(values, axis):
+    if values.shape[axis] < 2:
+        return 1.0
+    lower = [0, 0, 0]
+    upper = [0, 0, 0]
+    upper[axis] = 1
+    return max(abs(float(values[tuple(upper)] - values[tuple(lower)])), 1e-9)
+
+
+def _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object=None, sampling=0.0):
+    if boundary_mode == BOUNDARY_BOX:
+        return False
+    if boundary_mode == BOUNDARY_SPHERE:
+        center = np.array(
+            [
+                0.5 * (float(np.min(wx)) + float(np.max(wx))),
+                0.5 * (float(np.min(wy)) + float(np.max(wy))),
+                0.5 * (float(np.min(wz)) + float(np.max(wz))),
+            ]
+        )
+        radius = 0.5 * min(
+            float(np.max(wx)) - float(np.min(wx)),
+            float(np.max(wy)) - float(np.min(wy)),
+            float(np.max(wz)) - float(np.min(wz)),
+        )
+        field = radius * radius - ((wx - center[0]) ** 2 + (wy - center[1]) ** 2 + (wz - center[2]) ** 2)
+    elif boundary_mode == BOUNDARY_SELECTED_SOLID:
+        if boundary_object is None:
+            raise ValueError("Selected boundary needs a linked solid or mesh object")
+        try:
+            fallback_resolution = max(wx.shape)
+            field = _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+        except Exception as exc:
+            App.Console.PrintWarning(
+                "Signed-distance boundary sampling failed; falling back to binary classification: {}\n".format(exc)
+            )
+            try:
+                fallback_resolution = max(wx.shape)
+                field = _selected_boundary_field_binary_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+            except Exception:
+                if not hasattr(boundary_object, "Shape"):
+                    raise
+                tolerance = 1e-7
+                field = _selected_solid_field(boundary_object.Shape, wx, wy, wz, tolerance)
+    else:
+        raise ValueError("Unsupported boundary mode: {}".format(boundary_mode))
+
+    grid["boundary"] = field.ravel(order="F")
+    return True
+
+
+def _apply_boundary_clip(volume, has_boundary):
+    if not has_boundary:
+        return volume
+    return volume.clip_scalar(scalars="boundary", value=0.0, invert=False)
+
+
+def _contour_surface(grid, scalars):
+    return grid.contour(isosurfaces=[0.0], scalars=scalars).extract_surface(algorithm="dataset_surface").triangulate()
+
+
+def _combine_polydata(parts):
+    non_empty = [part for part in parts if part.n_points > 0 and part.n_cells > 0]
+    if not non_empty:
+        raise ValueError("Generated TPMS mesh is empty")
+    combined = non_empty[0]
+    for part in non_empty[1:]:
+        combined = combined.merge(part, merge_points=False)
+    return combined.clean().triangulate()
+
+
+def _generate_uncapped_polydata(grid, part, has_boundary):
+    if part == PART_SHEET:
+        surface = _combine_polydata(
+            [
+                _contour_surface(grid, "upper_surface"),
+                _contour_surface(grid, "lower_surface"),
+            ]
+        )
+    elif part == PART_UPPER:
+        surface = _contour_surface(grid, "upper_surface")
+    elif part == PART_LOWER:
+        surface = _contour_surface(grid, "lower_surface")
+    elif part == PART_SURFACE:
+        surface = _contour_surface(grid, "surface")
+    else:
+        raise ValueError("Unsupported TPMS part: {}".format(part))
+
+    surface = _apply_boundary_clip(surface, has_boundary)
+    return surface.clean().triangulate()
 
 
 def generate_polydata(
@@ -85,8 +420,21 @@ def generate_polydata(
     resolution=32,
     offset=0.3,
     phase=(0.0, 0.0, 0.0),
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
 ):
-    grid, x, y, z = _make_grid(cell_size, repeat_cell, resolution, phase)
+    configure_vtk_smp()
+    grid, x, y, z, wx, wy, wz = _make_grid(
+        cell_size,
+        repeat_cell,
+        resolution,
+        phase,
+        boundary_mode,
+        boundary_object,
+        sampling,
+    )
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
         field = np.full(x.shape, float(field))
@@ -94,18 +442,25 @@ def generate_polydata(
     grid["surface"] = field.ravel(order="F")
     grid["lower_surface"] = (field + 0.5 * float(offset)).ravel(order="F")
     grid["upper_surface"] = (field - 0.5 * float(offset)).ravel(order="F")
+    has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
+
+    if not add_caps:
+        return _generate_uncapped_polydata(grid, part, has_boundary)
 
     if part == PART_SHEET:
         volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
             scalars="lower_surface",
             invert=False,
         )
+        volume = _apply_boundary_clip(volume, has_boundary)
         return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
     if part == PART_UPPER:
         volume = grid.clip_scalar(scalars="upper_surface", invert=False)
+        volume = _apply_boundary_clip(volume, has_boundary)
         return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
     if part == PART_LOWER:
         volume = grid.clip_scalar(scalars="lower_surface")
+        volume = _apply_boundary_clip(volume, has_boundary)
         return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
     if part == PART_SURFACE:
         return grid.contour(isosurfaces=[0.0], scalars="surface").extract_surface().clean().triangulate()
@@ -118,20 +473,13 @@ def polydata_to_freecad_mesh(polydata):
     if len(faces) == 0:
         raise ValueError("Generated TPMS mesh is empty")
 
-    mesh = Mesh.Mesh()
-    points = polydata.points
-    i = 0
-    while i < len(faces):
-        count = int(faces[i])
-        if count == 3:
-            a, b, c = [int(v) for v in faces[i + 1 : i + 4]]
-            mesh.addFacet(
-                App.Vector(*points[a]),
-                App.Vector(*points[b]),
-                App.Vector(*points[c]),
-            )
-        i += count + 1
+    face_matrix = faces.reshape((-1, 4))
+    triangles = face_matrix[face_matrix[:, 0] == 3, 1:4]
+    if len(triangles) == 0:
+        raise ValueError("Generated TPMS mesh has no triangular facets")
 
+    facets = np.asarray(polydata.points, dtype=float)[triangles].tolist()
+    mesh = Mesh.Mesh(facets)
     try:
         mesh.harmonizeNormals()
     except Exception:
@@ -139,22 +487,350 @@ def polydata_to_freecad_mesh(polydata):
     return mesh
 
 
+def relax_polydata_lloyd(polydata, iterations=5, skip_boundary=True, relax_cap_surface=False):
+    iterations = max(0, int(iterations))
+    if iterations == 0 or polydata.n_points == 0:
+        return polydata
+
+    relaxed = polydata.triangulate().copy(deep=True)
+    faces = np.asarray(relaxed.faces, dtype=np.int64)
+    if len(faces) == 0:
+        return relaxed
+
+    face_matrix = faces.reshape((-1, 4))
+    triangles = face_matrix[face_matrix[:, 0] == 3, 1:4]
+    if len(triangles) == 0:
+        return relaxed
+
+    points = np.asarray(relaxed.points, dtype=float).copy()
+    fixed = _relax_fixed_vertices(relaxed, relax_cap_surface) if skip_boundary else np.zeros(len(points), dtype=bool)
+    cap = _cap_vertices(relaxed) if skip_boundary and relax_cap_surface else np.zeros(len(points), dtype=bool)
+    cap_movable = cap & ~fixed
+    cap_origin = points.copy()
+    cap_normals = _cap_vertex_normals(relaxed, triangles, cap) if np.any(cap_movable) else None
+
+    edges = np.vstack(
+        (
+            triangles[:, [0, 1]],
+            triangles[:, [1, 2]],
+            triangles[:, [2, 0]],
+        )
+    )
+    edges = np.vstack((edges, edges[:, ::-1]))
+    source = edges[:, 0]
+    target = edges[:, 1]
+    counts = np.bincount(source, minlength=len(points)).astype(float)
+    movable = (~fixed) & (counts > 0) & (~cap_movable)
+
+    cap_source = cap_target = cap_counts = None
+    if np.any(cap_movable):
+        cap_face_mask = cap[triangles].all(axis=1)
+        cap_triangles = triangles[cap_face_mask]
+        if len(cap_triangles):
+            cap_edges = np.vstack(
+                (
+                    cap_triangles[:, [0, 1]],
+                    cap_triangles[:, [1, 2]],
+                    cap_triangles[:, [2, 0]],
+                )
+            )
+            cap_edges = np.vstack((cap_edges, cap_edges[:, ::-1]))
+            cap_source = cap_edges[:, 0]
+            cap_target = cap_edges[:, 1]
+            cap_counts = np.bincount(cap_source, minlength=len(points)).astype(float)
+        else:
+            cap_movable[:] = False
+
+    for iteration in range(iterations):
+        sums = np.zeros_like(points)
+        np.add.at(sums, source, points[target])
+        averages = points.copy()
+        averages[movable] = sums[movable] / counts[movable, None]
+        points[movable] = averages[movable]
+        if iteration == 0 and cap_normals is not None and np.any(cap_movable):
+            cap_sums = np.zeros_like(points)
+            np.add.at(cap_sums, cap_source, points[cap_target])
+            cap_valid = cap_movable & (cap_counts > 0)
+            points[cap_valid] = cap_sums[cap_valid] / cap_counts[cap_valid, None]
+            displacement = points[cap_movable] - cap_origin[cap_movable]
+            normals = cap_normals[cap_movable]
+            normal_part = np.sum(displacement * normals, axis=1)[:, None] * normals
+            points[cap_movable] = cap_origin[cap_movable] + displacement - normal_part
+
+    relaxed.points = points
+    return relaxed
+
+
+def _relax_fixed_vertices(polydata, relax_cap_surface=False):
+    points = np.asarray(polydata.points, dtype=float)
+    fixed = np.zeros(polydata.n_points, dtype=bool)
+
+    cap = _cap_vertices(polydata)
+    if np.any(cap):
+        if relax_cap_surface:
+            fixed |= _cap_seam_vertices(polydata, cap)
+        else:
+            fixed |= cap
+
+    if not np.any(fixed):
+        bounds = polydata.bounds
+        span = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4], 1.0)
+        tolerance = span * 1e-7
+        fixed |= np.isclose(points[:, 0], bounds[0], atol=tolerance)
+        fixed |= np.isclose(points[:, 0], bounds[1], atol=tolerance)
+        fixed |= np.isclose(points[:, 1], bounds[2], atol=tolerance)
+        fixed |= np.isclose(points[:, 1], bounds[3], atol=tolerance)
+        fixed |= np.isclose(points[:, 2], bounds[4], atol=tolerance)
+        fixed |= np.isclose(points[:, 2], bounds[5], atol=tolerance)
+
+    return fixed
+
+
+def _cap_vertices(polydata):
+    if "boundary" not in polydata.point_data:
+        return np.zeros(polydata.n_points, dtype=bool)
+    boundary = np.asarray(polydata.point_data["boundary"], dtype=float)
+    finite_boundary = boundary[np.isfinite(boundary)]
+    if not len(finite_boundary):
+        return np.zeros(polydata.n_points, dtype=bool)
+    scale = max(float(np.max(np.abs(finite_boundary))), 1.0)
+    return np.abs(boundary) <= max(scale * 1e-6, 1e-9)
+
+
+def _cap_seam_vertices(polydata, cap):
+    candidates = []
+    for name in ("upper_surface", "lower_surface", "surface"):
+        if name not in polydata.point_data:
+            continue
+        values = np.asarray(polydata.point_data[name], dtype=float)
+        finite_values = values[np.isfinite(values)]
+        if not len(finite_values):
+            continue
+        scale = max(float(np.max(np.abs(finite_values))), 1.0)
+        candidates.append(np.abs(values) <= max(scale * 1e-6, 1e-9))
+
+    if not candidates:
+        return cap
+    seam = np.zeros(polydata.n_points, dtype=bool)
+    for candidate in candidates:
+        seam |= cap & candidate
+    return seam
+
+
+def _cap_vertex_normals(polydata, triangles, cap):
+    points = np.asarray(polydata.points, dtype=float)
+    normals = np.zeros_like(points)
+    cap_faces = cap[triangles].all(axis=1)
+    for triangle in triangles[cap_faces]:
+        a, b, c = points[triangle]
+        normal = np.cross(b - a, c - a)
+        length = np.linalg.norm(normal)
+        if length <= 1e-12:
+            continue
+        normal = normal / length
+        normals[triangle] += normal
+
+    lengths = np.linalg.norm(normals, axis=1)
+    valid = lengths > 1e-12
+    normals[valid] /= lengths[valid, None]
+    normals[~valid] = np.array((0.0, 0.0, 1.0))
+    return normals
+
+
+def _prepare_polydata(
+    polydata,
+    mesh_relaxation=False,
+    relax_iterations=5,
+    relax_skip_boundary=True,
+    relax_cap_surface=False,
+):
+    if mesh_relaxation:
+        return relax_polydata_lloyd(polydata, relax_iterations, relax_skip_boundary, relax_cap_surface)
+    return polydata
+
+
+def _prepare_freecad_mesh(
+    polydata,
+    mesh_relaxation=False,
+    relax_iterations=5,
+    relax_skip_boundary=True,
+    relax_cap_surface=False,
+    require_closed=False,
+):
+    prepared = _prepare_polydata(polydata, mesh_relaxation, relax_iterations, relax_skip_boundary, relax_cap_surface)
+    mesh = polydata_to_freecad_mesh(prepared)
+    if (
+        require_closed
+        and mesh_relaxation
+        and relax_skip_boundary
+        and relax_cap_surface
+        and not mesh.isSolid()
+    ):
+        App.Console.PrintWarning("Cap relaxation did not preserve a closed mesh; keeping cap vertices fixed.\n")
+        prepared = relax_polydata_lloyd(polydata, relax_iterations, relax_skip_boundary, False)
+        mesh = polydata_to_freecad_mesh(prepared)
+    return mesh
+
+
+def translated_copy_mesh(mesh, offset):
+    copied = mesh.copy()
+    copied.translate(float(offset[0]), float(offset[1]), float(offset[2]))
+    return copied
+
+
+def generate_freecad_mesh(
+    equation,
+    part=PART_SHEET,
+    cell_size=(10.0, 10.0, 10.0),
+    repeat_cell=(1, 1, 1),
+    resolution=16,
+    offset=0.3,
+    phase=(0.0, 0.0, 0.0),
+    mesh_stitching=False,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
+    mesh_relaxation=False,
+    relax_iterations=5,
+    relax_skip_boundary=True,
+    relax_cap_surface=False,
+):
+    repeat_cell = tuple(max(1, int(value)) for value in repeat_cell)
+    cell_size = tuple(float(value) for value in cell_size)
+
+    if mesh_stitching:
+        polydata = generate_polydata(
+            equation,
+            part,
+            cell_size,
+            repeat_cell,
+            resolution,
+            offset,
+            phase,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            add_caps,
+        )
+        return _prepare_freecad_mesh(
+            polydata,
+            mesh_relaxation,
+            relax_iterations,
+            relax_skip_boundary,
+            relax_cap_surface,
+            add_caps,
+        )
+
+    if boundary_mode != BOUNDARY_BOX:
+        polydata = generate_polydata(
+            equation,
+            part,
+            cell_size,
+            repeat_cell,
+            resolution,
+            offset,
+            phase,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            add_caps,
+        )
+        return _prepare_freecad_mesh(
+            polydata,
+            mesh_relaxation,
+            relax_iterations,
+            relax_skip_boundary,
+            relax_cap_surface,
+            add_caps,
+        )
+
+    polydata = generate_polydata(
+        equation,
+        part,
+        cell_size,
+        (1, 1, 1),
+        resolution,
+        offset,
+        phase,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        add_caps,
+    )
+    unit_mesh = _prepare_freecad_mesh(
+        polydata,
+        mesh_relaxation,
+        relax_iterations,
+        relax_skip_boundary,
+        relax_cap_surface,
+        add_caps,
+    )
+    combined = Mesh.Mesh()
+    origin_shift = (
+        -0.5 * cell_size[0] * (repeat_cell[0] - 1),
+        -0.5 * cell_size[1] * (repeat_cell[1] - 1),
+        -0.5 * cell_size[2] * (repeat_cell[2] - 1),
+    )
+
+    for ix in range(repeat_cell[0]):
+        for iy in range(repeat_cell[1]):
+            for iz in range(repeat_cell[2]):
+                offset_vector = (
+                    origin_shift[0] + ix * cell_size[0],
+                    origin_shift[1] + iy * cell_size[1],
+                    origin_shift[2] + iz * cell_size[2],
+                )
+                combined.addMesh(translated_copy_mesh(unit_mesh, offset_vector))
+
+    try:
+        combined.harmonizeNormals()
+    except Exception:
+        pass
+    return combined
+
+
 def add_tpms_mesh_to_document(
     equation,
     part=PART_SHEET,
-    cell_size=(1.0, 1.0, 1.0),
+    cell_size=(10.0, 10.0, 10.0),
     repeat_cell=(1, 1, 1),
-    resolution=32,
+    resolution=16,
     offset=0.3,
     phase=(0.0, 0.0, 0.0),
+    mesh_stitching=False,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
+    mesh_relaxation=False,
+    relax_iterations=5,
+    relax_skip_boundary=True,
+    relax_cap_surface=False,
     label="TPMS unit cell",
 ):
     if App.ActiveDocument is None:
         App.newDocument("TPMS")
     doc = App.ActiveDocument
 
-    polydata = generate_polydata(equation, part, cell_size, repeat_cell, resolution, offset, phase)
-    mesh = polydata_to_freecad_mesh(polydata)
+    mesh = generate_freecad_mesh(
+        equation,
+        part,
+        cell_size,
+        repeat_cell,
+        resolution,
+        offset,
+        phase,
+        mesh_stitching,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        add_caps,
+        mesh_relaxation,
+        relax_iterations,
+        relax_skip_boundary,
+        relax_cap_surface,
+    )
 
     obj = doc.addObject("Mesh::Feature", "TPMS_Unit_Cell")
     obj.Mesh = mesh
@@ -166,6 +842,14 @@ def add_tpms_mesh_to_document(
     obj.addProperty("App::PropertyInteger", "RepeatY", "TPMS", "Unit cells in Y")
     obj.addProperty("App::PropertyInteger", "RepeatZ", "TPMS", "Unit cells in Z")
     obj.addProperty("App::PropertyFloat", "Offset", "TPMS", "Sheet thickness or skeletal iso spacing")
+    obj.addProperty("App::PropertyBool", "MeshStitching", "TPMS", "Stitch repeated mesh boundaries")
+    obj.addProperty("App::PropertyString", "BoundaryMode", "Boundary", "Boundary used to clip the generated TPMS")
+    obj.addProperty("App::PropertyFloat", "Sampling", "Boundary", "Target grid resolution along the longest sampled axis; 0 uses Resolution")
+    obj.addProperty("App::PropertyBool", "AddCaps", "Boundary", "Add caps where TPMS intersects the boundary")
+    obj.addProperty("App::PropertyBool", "MeshRelaxation", "Relaxation", "Apply Lloyd-style mesh relaxation")
+    obj.addProperty("App::PropertyInteger", "RelaxIterations", "Relaxation", "Lloyd-style relaxation iterations")
+    obj.addProperty("App::PropertyBool", "RelaxSkipBoundary", "Relaxation", "Keep boundary/cap vertices fixed during relaxation")
+    obj.addProperty("App::PropertyBool", "RelaxCapSurface", "Relaxation", "Allow cap vertices to relax tangentially while keeping seam fixed")
     obj.ImplicitEquation = equation
     obj.TPMSPart = part
     obj.Resolution = int(resolution)
@@ -173,5 +857,13 @@ def add_tpms_mesh_to_document(
     obj.RepeatY = int(repeat_cell[1])
     obj.RepeatZ = int(repeat_cell[2])
     obj.Offset = float(offset)
+    obj.MeshStitching = bool(mesh_stitching)
+    obj.BoundaryMode = str(boundary_mode)
+    obj.Sampling = float(sampling)
+    obj.AddCaps = bool(add_caps)
+    obj.MeshRelaxation = bool(mesh_relaxation)
+    obj.RelaxIterations = int(relax_iterations)
+    obj.RelaxSkipBoundary = bool(relax_skip_boundary)
+    obj.RelaxCapSurface = bool(relax_cap_surface)
     doc.recompute()
     return obj
