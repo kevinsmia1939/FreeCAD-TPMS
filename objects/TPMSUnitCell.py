@@ -39,7 +39,9 @@ def make_tpms_unit_cell(doc=None):
     controller.RotationMode = "Same as origin"
     controller.OriginRotation = App.Vector(0.0, 0.0, 0.0)
     controller.DensityMode = "Uniform"
+    controller.DensityGradient = "Selected-face distance field"
     controller.BaseDensity = 1.0
+    controller.DensityCountMode = tpms_generator.DENSITY_COUNT_FOLLOW
     controller.FaceDensity = 1.5
     controller.DensityTransition = 5.0
     controller.MeshStitching = False
@@ -114,9 +116,21 @@ class TPMSUnitCell:
             obj.addProperty("App::PropertyEnumeration", "DensityMode", "Density", "How TPMS cell density is controlled")
             obj.DensityMode = ["Uniform", "Non-uniform"]
             obj.DensityMode = "Uniform"
+        if not hasattr(obj, "DensityGradient"):
+            obj.addProperty("App::PropertyEnumeration", "DensityGradient", "Density", "Source of the non-uniform density field")
+        try:
+            current_density_gradient = str(obj.DensityGradient)
+            obj.DensityGradient = ["Selected-face distance field", "Face plane"]
+            obj.DensityGradient = current_density_gradient if current_density_gradient in ("Selected-face distance field", "Face plane") else "Selected-face distance field"
+        except Exception:
+            pass
         if not hasattr(obj, "BaseDensity"):
             obj.addProperty("App::PropertyFloat", "BaseDensity", "Density", "Base TPMS density multiplier")
             obj.BaseDensity = 1.0
+        if not hasattr(obj, "DensityCountMode"):
+            obj.addProperty("App::PropertyEnumeration", "DensityCountMode", "Density", "How non-uniform density affects total TPMS cell count")
+            obj.DensityCountMode = [tpms_generator.DENSITY_COUNT_FOLLOW, tpms_generator.DENSITY_COUNT_PRESERVE]
+            obj.DensityCountMode = tpms_generator.DENSITY_COUNT_FOLLOW
         if not hasattr(obj, "FaceDensity"):
             obj.addProperty("App::PropertyFloat", "FaceDensity", "Density", "Default density multiplier for new selected-face controls")
             obj.FaceDensity = 1.5
@@ -220,6 +234,7 @@ class TPMSUnitCell:
                 str(getattr(obj, "DensityMode", "Uniform")),
                 max(0.05, float(getattr(obj, "BaseDensity", 1.0))),
                 density_controls,
+                str(getattr(obj, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW)),
             )
         except Exception as exc:
             obj.LastError = str(exc)
@@ -407,6 +422,7 @@ def _origin_rotation(obj):
 def _density_controls(obj):
     if str(getattr(obj, "DensityMode", "Uniform")) != "Non-uniform":
         return []
+    gradient = str(getattr(obj, "DensityGradient", "Selected-face distance field"))
     controls = []
     for control in getattr(obj, "FaceControls", []):
         if control is None or not bool(getattr(control, "Enabled", True)):
@@ -419,6 +435,7 @@ def _density_controls(obj):
             try:
                 face = shape.getElement(str(face_name))
                 point, normal = _face_point_normal(face)
+                surface = _face_surface_mesh(face) if gradient == "Selected-face distance field" else None
             except Exception as exc:
                 App.Console.PrintWarning(
                     "Ignoring TPMS density control {} {}: {}\n".format(
@@ -430,10 +447,12 @@ def _density_controls(obj):
                 continue
             controls.append(
                 {
+                    "type": "face_distance" if surface is not None else "face_plane",
                     "point": point,
                     "normal": normal,
                     "density": max(0.05, float(getattr(control, "DensityFactor", 1.0))),
                     "transition": max(1e-9, float(getattr(control, "Transition", 1.0))),
+                    "surface": surface,
                 }
             )
     return controls
@@ -454,6 +473,18 @@ def _face_point_normal(face):
         (float(point.x), float(point.y), float(point.z)),
         (float(normal.x), float(normal.y), float(normal.z)),
     )
+
+
+def _face_surface_mesh(face):
+    bb = face.BoundBox
+    span = max(float(bb.XLength), float(bb.YLength), float(bb.ZLength), 1e-9)
+    points, triangles = face.tessellate(span / 80.0)
+    if not points or not triangles:
+        raise ValueError("selected face could not be tessellated")
+    return {
+        "points": [(float(point.x), float(point.y), float(point.z)) for point in points],
+        "triangles": [tuple(int(index) for index in triangle) for triangle in triangles],
+    }
 
 
 def _container_for(obj):

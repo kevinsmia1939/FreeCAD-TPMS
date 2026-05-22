@@ -28,6 +28,8 @@ PART_SURFACE = "Zero surface"
 BOUNDARY_BOX = "Box"
 BOUNDARY_SPHERE = "Sphere"
 BOUNDARY_SELECTED_SOLID = "Selected solid"
+DENSITY_COUNT_PRESERVE = "Preserve overall count"
+DENSITY_COUNT_FOLLOW = "Follow density settings"
 
 _BOUNDARY_FIELD_CACHE = {}
 _BOUNDARY_FIELD_CACHE_ORDER = []
@@ -134,6 +136,7 @@ def _make_grid(
     density_mode="Uniform",
     base_density=1.0,
     density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
 ):
     cell_size = np.asarray(cell_size, dtype=float)
     repeat_cell = np.asarray(repeat_cell, dtype=int)
@@ -148,6 +151,8 @@ def _make_grid(
         bounds = _shape_bounds(boundary_object)
         fallback_spacing = min(float(value) / max(int(resolution), 1) for value in cell_size)
         spacing = max(fallback_spacing, 1e-9)
+        if _needs_curved_analytic_padding(boundary_object):
+            bounds = [(axis_min - spacing, axis_max + spacing) for axis_min, axis_max in bounds]
         default_counts = [
             int(math.ceil(max(bounds[i][1] - bounds[i][0], 1e-9) / spacing)) + 1
             for i in range(3)
@@ -179,11 +184,23 @@ def _make_grid(
         ty = wy - phase_origin[1]
         tz = wz - phase_origin[2]
 
-    density = _density_multiplier(wx, wy, wz, density_mode, base_density, density_controls)
+    px, py, pz = _density_phase_coordinates(
+        tx,
+        ty,
+        tz,
+        wx,
+        wy,
+        wz,
+        phase,
+        density_mode,
+        base_density,
+        density_controls,
+        density_count_mode,
+    )
     kx, ky, kz = [2.0 * math.pi / max(cell_size[i], 1e-9) for i in range(3)]
-    sx = kx * (tx + phase[0]) * density
-    sy = ky * (ty + phase[1]) * density
-    sz = kz * (tz + phase[2]) * density
+    sx = kx * px
+    sy = ky * py
+    sz = kz * pz
     return grid, sx, sy, sz, wx, wy, wz
 
 
@@ -201,6 +218,20 @@ def _default_origin(boundary_mode, boundary_object):
     return (0.0, 0.0, 0.0)
 
 
+def _needs_curved_analytic_padding(boundary_object):
+    type_id = getattr(boundary_object, "TypeId", "")
+    if type_id == "Part::Sphere" and hasattr(boundary_object, "Radius"):
+        return True
+    if _is_part_cylinder(boundary_object):
+        return True
+    if _is_part_box(boundary_object):
+        return False
+    shape = getattr(boundary_object, "Shape", None)
+    if shape is None or shape.isNull():
+        return False
+    return _cylindrical_shell_from_shape(shape) is not None or _spherical_shell_from_shape(shape) is not None
+
+
 def _density_multiplier(wx, wy, wz, density_mode="Uniform", base_density=1.0, density_controls=None):
     base = max(0.05, float(base_density))
     density = np.full(wx.shape, base, dtype=float)
@@ -209,6 +240,9 @@ def _density_multiplier(wx, wy, wz, density_mode="Uniform", base_density=1.0, de
 
     for control in density_controls:
         try:
+            if control.get("type") == "face_distance":
+                density = _apply_face_distance_density_multiplier(density, wx, wy, wz, control, base)
+                continue
             point = np.asarray(control["point"], dtype=float)
             normal = np.asarray(control["normal"], dtype=float)
             target = max(0.05, float(control["density"]))
@@ -229,6 +263,111 @@ def _density_multiplier(wx, wy, wz, density_mode="Uniform", base_density=1.0, de
         weight = 1.0 - smooth
         density += weight * (target - base)
     return np.maximum(density, 0.05)
+
+
+def _density_phase_coordinates(
+    tx,
+    ty,
+    tz,
+    wx,
+    wy,
+    wz,
+    phase,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
+):
+    base = max(0.05, float(base_density))
+    px = base * (tx + phase[0])
+    py = base * (ty + phase[1])
+    pz = base * (tz + phase[2])
+
+    if str(density_mode) != "Non-uniform" or not density_controls:
+        return px, py, pz
+
+    if str(density_count_mode) == DENSITY_COUNT_PRESERVE:
+        density = _density_multiplier(wx, wy, wz, density_mode, base_density, density_controls)
+        return (tx + phase[0]) * density, (ty + phase[1]) * density, (tz + phase[2]) * density
+
+    for control in density_controls:
+        try:
+            if control.get("type") == "face_distance":
+                px, py, pz = _apply_face_distance_phase_coordinates(px, py, pz, wx, wy, wz, control, base)
+                continue
+            point = np.asarray(control["point"], dtype=float)
+            normal = np.asarray(control["normal"], dtype=float)
+            target = max(0.05, float(control["density"]))
+            transition = max(1e-9, float(control["transition"]))
+        except Exception:
+            continue
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-12:
+            continue
+        normal = normal / norm
+        signed_distance = (
+            (wx - point[0]) * normal[0]
+            + (wy - point[1]) * normal[1]
+            + (wz - point[2]) * normal[2]
+        )
+        u = np.clip(np.abs(signed_distance) / transition, 0.0, 1.0)
+        integral = u - u**3 + 0.5 * u**4
+        correction = np.sign(signed_distance) * (target - base) * transition * integral
+        px += correction * normal[0]
+        py += correction * normal[1]
+        pz += correction * normal[2]
+    return px, py, pz
+
+
+def _apply_face_distance_density_multiplier(density, wx, wy, wz, control, base):
+    distance = np.abs(_face_distance_field(wx, wy, wz, control))
+    target = max(0.05, float(control.get("density", base)))
+    transition = max(1e-9, float(control.get("transition", 1.0)))
+    weight = _smooth_falloff_weight(distance, transition)
+    return density + weight * (target - base)
+
+
+def _apply_face_distance_phase_coordinates(px, py, pz, wx, wy, wz, control, base):
+    signed_distance = _face_distance_field(wx, wy, wz, control)
+    distance = np.abs(signed_distance)
+    target = max(0.05, float(control.get("density", base)))
+    transition = max(1e-9, float(control.get("transition", 1.0)))
+    u = np.clip(distance / transition, 0.0, 1.0)
+    integral = u - u**3 + 0.5 * u**4
+    correction = np.sign(signed_distance) * (target - base) * transition * integral
+    gx, gy, gz = np.gradient(signed_distance)
+    length = np.sqrt(gx * gx + gy * gy + gz * gz)
+    length = np.maximum(length, 1e-12)
+    px = px + correction * gx / length
+    py = py + correction * gy / length
+    pz = pz + correction * gz / length
+    return px, py, pz
+
+
+def _face_distance_field(wx, wy, wz, control):
+    surface = _control_surface_polydata(control)
+    points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
+    return _implicit_distances(surface, points).reshape(wx.shape, order="C")
+
+
+def _control_surface_polydata(control):
+    surface = control.get("surface") or {}
+    points = np.asarray(surface.get("points", []), dtype=float)
+    triangles = surface.get("triangles", [])
+    if len(points) == 0 or len(triangles) == 0:
+        raise ValueError("selected face density control has no tessellated surface")
+    face_array = np.empty(len(triangles) * 4, dtype=np.int64)
+    face_array[0::4] = 3
+    for index, triangle in enumerate(triangles):
+        base = index * 4
+        face_array[base + 1 : base + 4] = triangle
+    return pv.PolyData(points, face_array).triangulate().clean()
+
+
+def _smooth_falloff_weight(distance, transition):
+    t = np.clip(distance / max(float(transition), 1e-12), 0.0, 1.0)
+    smooth = t * t * (3.0 - 2.0 * t)
+    return 1.0 - smooth
 
 
 def _selected_solid_field(shape, wx, wy, wz, tolerance):
@@ -455,6 +594,12 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
         lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
         return radius - np.sqrt(lx * lx + ly * ly + lz * lz)
 
+    if _is_part_cylinder(boundary_object):
+        radius = float(boundary_object.Radius)
+        height = float(boundary_object.Height)
+        lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+        return _cylindrical_shell_field(lx, ly, lz, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), radius, 0.0, 0.0, height)
+
     if _is_part_box(boundary_object):
         length = float(boundary_object.Length)
         width = float(boundary_object.Width)
@@ -471,7 +616,26 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
         )
         return np.where(inside_distance >= 0.0, inside_distance, -outside)
 
+    if hasattr(boundary_object, "Shape"):
+        sphere_shell = _spherical_shell_from_shape(boundary_object.Shape)
+        if sphere_shell is not None:
+            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+            return _spherical_shell_field(lx, ly, lz, *sphere_shell)
+        shell = _cylindrical_shell_from_shape(boundary_object.Shape)
+        if shell is not None:
+            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+            return _cylindrical_shell_field(lx, ly, lz, *shell)
+
     return None
+
+
+def _is_part_cylinder(boundary_object):
+    if getattr(boundary_object, "TypeId", "") != "Part::Cylinder":
+        return False
+    if not all(hasattr(boundary_object, name) for name in ("Radius", "Height")):
+        return False
+    angle = float(getattr(boundary_object, "Angle", 360.0))
+    return abs(angle - 360.0) <= 1e-7
 
 
 def _is_part_box(boundary_object):
@@ -479,6 +643,154 @@ def _is_part_box(boundary_object):
         getattr(boundary_object, "TypeId", "") == "Part::Box"
         and all(hasattr(boundary_object, name) for name in ("Length", "Width", "Height"))
     )
+
+
+def _cylindrical_shell_from_shape(shape):
+    if shape is None or shape.isNull():
+        return None
+
+    cylinders = []
+    for face in shape.Faces:
+        surface = face.Surface
+        if type(surface).__name__ != "Cylinder" or not hasattr(surface, "Radius"):
+            continue
+        try:
+            umin, umax, _vmin, _vmax = face.ParameterRange
+        except Exception:
+            return None
+        if abs(abs(float(umax) - float(umin)) - 2.0 * math.pi) > 1e-5:
+            return None
+        center = _vector_array(surface.Center)
+        axis = _unit_array(surface.Axis)
+        if axis is None:
+            return None
+        cylinders.append((float(surface.Radius), center, axis))
+
+    if len(cylinders) not in (1, 2):
+        return None
+
+    cylinders.sort(key=lambda item: item[0])
+    radii = [item[0] for item in cylinders]
+    if radii[-1] <= 1e-9:
+        return None
+    if len(radii) == 2 and abs(radii[1] - radii[0]) <= max(radii[1] * 1e-7, 1e-9):
+        return None
+
+    center = cylinders[-1][1]
+    axis = cylinders[-1][2]
+    tolerance = max(radii[-1] * 1e-6, 1e-7)
+    for _radius, other_center, other_axis in cylinders:
+        if abs(abs(float(np.dot(axis, other_axis))) - 1.0) > 1e-6:
+            return None
+        offset = other_center - center
+        radial_offset = offset - np.dot(offset, axis) * axis
+        if float(np.linalg.norm(radial_offset)) > tolerance:
+            return None
+
+    projections = []
+    for vertex in shape.Vertexes:
+        point = _vector_array(vertex.Point)
+        projections.append(float(np.dot(point - center, axis)))
+    if not projections:
+        return None
+    hmin = min(projections)
+    hmax = max(projections)
+    if hmax - hmin <= 1e-9:
+        return None
+
+    inner_radius = radii[0] if len(radii) == 2 else 0.0
+    outer_radius = radii[-1]
+    return tuple(center), tuple(axis), outer_radius, inner_radius, hmin, hmax
+
+
+def _spherical_shell_from_shape(shape):
+    if shape is None or shape.isNull():
+        return None
+
+    spheres = []
+    for face in shape.Faces:
+        surface = face.Surface
+        if type(surface).__name__ != "Sphere" or not hasattr(surface, "Radius"):
+            continue
+        center = _vector_array(surface.Center)
+        spheres.append((float(surface.Radius), center))
+
+    if len(spheres) not in (1, 2):
+        return None
+
+    spheres.sort(key=lambda item: item[0])
+    radii = [item[0] for item in spheres]
+    if radii[-1] <= 1e-9:
+        return None
+    if len(radii) == 2 and abs(radii[1] - radii[0]) <= max(radii[1] * 1e-7, 1e-9):
+        return None
+
+    center = spheres[-1][1]
+    tolerance = max(radii[-1] * 1e-6, 1e-7)
+    for _radius, other_center in spheres:
+        if float(np.linalg.norm(other_center - center)) > tolerance:
+            return None
+
+    inner_radius = radii[0] if len(radii) == 2 else 0.0
+    outer_radius = radii[-1]
+    return tuple(center), outer_radius, inner_radius
+
+
+def _spherical_shell_field(px, py, pz, center, outer_radius, inner_radius):
+    center = np.asarray(center, dtype=float)
+    dx = px - center[0]
+    dy = py - center[1]
+    dz = pz - center[2]
+    radius = np.sqrt(dx * dx + dy * dy + dz * dz)
+
+    inner_radius = max(0.0, float(inner_radius))
+    outer_radius = max(inner_radius + 1e-12, float(outer_radius))
+    inside_distance = np.minimum(radius - inner_radius, outer_radius - radius)
+    outside = np.maximum(inner_radius - radius, 0.0) + np.maximum(radius - outer_radius, 0.0)
+    return np.where(inside_distance >= 0.0, inside_distance, -outside)
+
+
+def _cylindrical_shell_field(px, py, pz, center, axis, outer_radius, inner_radius, hmin, hmax):
+    center = np.asarray(center, dtype=float)
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+    dx = px - center[0]
+    dy = py - center[1]
+    dz = pz - center[2]
+    axial = dx * axis[0] + dy * axis[1] + dz * axis[2]
+    radial_sq = dx * dx + dy * dy + dz * dz - axial * axial
+    radial = np.sqrt(np.maximum(radial_sq, 0.0))
+
+    inner_radius = max(0.0, float(inner_radius))
+    outer_radius = max(inner_radius + 1e-12, float(outer_radius))
+    lower = float(hmin)
+    upper = float(hmax)
+
+    inside_distance = np.minimum.reduce(
+        (
+            radial - inner_radius,
+            outer_radius - radial,
+            axial - lower,
+            upper - axial,
+        )
+    )
+    radial_outside = np.maximum(inner_radius - radial, 0.0) + np.maximum(radial - outer_radius, 0.0)
+    axial_outside = np.maximum(lower - axial, 0.0) + np.maximum(axial - upper, 0.0)
+    outside = np.sqrt(radial_outside * radial_outside + axial_outside * axial_outside)
+    return np.where(inside_distance >= 0.0, inside_distance, -outside)
+
+
+def _vector_array(vector):
+    return np.array((float(vector.x), float(vector.y), float(vector.z)), dtype=float)
+
+
+def _unit_array(vector):
+    values = _vector_array(vector)
+    length = float(np.linalg.norm(values))
+    if length <= 1e-12:
+        return None
+    return values / length
 
 
 def _world_to_local_arrays(placement, wx, wy, wz):
@@ -594,6 +906,7 @@ def generate_polydata(
     density_mode="Uniform",
     base_density=1.0,
     density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
 ):
     configure_vtk_smp()
     grid, x, y, z, wx, wy, wz = _make_grid(
@@ -609,6 +922,7 @@ def generate_polydata(
         density_mode,
         base_density,
         density_controls,
+        density_count_mode,
     )
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
@@ -875,6 +1189,7 @@ def generate_freecad_mesh(
     density_mode="Uniform",
     base_density=1.0,
     density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
 ):
     repeat_cell = tuple(max(1, int(value)) for value in repeat_cell)
     cell_size = tuple(float(value) for value in cell_size)
@@ -897,6 +1212,7 @@ def generate_freecad_mesh(
             density_mode,
             base_density,
             density_controls,
+            density_count_mode,
         )
         return _prepare_freecad_mesh(
             polydata,
@@ -925,6 +1241,7 @@ def generate_freecad_mesh(
             density_mode,
             base_density,
             density_controls,
+            density_count_mode,
         )
         mesh = _prepare_freecad_mesh(
             polydata,
@@ -953,6 +1270,7 @@ def generate_freecad_mesh(
         density_mode,
         base_density,
         density_controls,
+        density_count_mode,
     )
     unit_mesh = _prepare_freecad_mesh(
         polydata,
@@ -1008,6 +1326,7 @@ def add_tpms_mesh_to_document(
     density_mode="Uniform",
     base_density=1.0,
     density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
     label="TPMS unit cell",
 ):
     if App.ActiveDocument is None:
@@ -1036,6 +1355,7 @@ def add_tpms_mesh_to_document(
         density_mode,
         base_density,
         density_controls,
+        density_count_mode,
     )
 
     obj = doc.addObject("Mesh::Feature", "TPMS_Unit_Cell")
@@ -1060,6 +1380,7 @@ def add_tpms_mesh_to_document(
     obj.addProperty("App::PropertyVector", "OriginRotation", "TPMS", "TPMS origin-frame rotation in XYZ degrees")
     obj.addProperty("App::PropertyString", "DensityMode", "Density", "Density control mode")
     obj.addProperty("App::PropertyFloat", "BaseDensity", "Density", "Base TPMS density multiplier")
+    obj.addProperty("App::PropertyString", "DensityCountMode", "Density", "How non-uniform density affects total TPMS cell count")
     obj.ImplicitEquation = equation
     obj.TPMSPart = part
     obj.Resolution = int(resolution)
@@ -1077,6 +1398,7 @@ def add_tpms_mesh_to_document(
     obj.RelaxCapSurface = bool(relax_cap_surface)
     obj.DensityMode = str(density_mode)
     obj.BaseDensity = float(base_density)
+    obj.DensityCountMode = str(density_count_mode)
     if origin is not None:
         obj.Origin = App.Vector(float(origin[0]), float(origin[1]), float(origin[2]))
     if origin_rotation is not None and not hasattr(origin_rotation, "toMatrix"):

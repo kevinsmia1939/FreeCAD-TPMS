@@ -61,8 +61,26 @@ class TPMSTaskPanel:
         self.density_mode.setCurrentText(str(getattr(obj, "DensityMode", "Uniform")))
         density_group.addRow("Density", self.density_mode)
 
+        self.density_gradient = QtWidgets.QComboBox()
+        self.density_gradient.addItems(["Selected-face distance field", "Face plane"])
+        density_gradient = str(getattr(obj, "DensityGradient", "Selected-face distance field"))
+        if density_gradient not in ("Selected-face distance field", "Face plane"):
+            density_gradient = "Selected-face distance field"
+        self.density_gradient.setCurrentText(density_gradient)
+        density_group.addRow("Gradient source", self.density_gradient)
+
         self.base_density = self._double_spin(float(getattr(obj, "BaseDensity", 1.0)), 0.05, 1000.0, 0.05)
         density_group.addRow("Base density", self.base_density)
+
+        self.density_count_mode = QtWidgets.QComboBox()
+        self.density_count_mode.addItems([
+            tpms_generator.DENSITY_COUNT_FOLLOW,
+            tpms_generator.DENSITY_COUNT_PRESERVE,
+        ])
+        self.density_count_mode.setCurrentText(
+            str(getattr(obj, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW))
+        )
+        density_group.addRow("Unit-cell count", self.density_count_mode)
 
         self.face_density = self._double_spin(float(getattr(obj, "FaceDensity", 1.5)), 0.05, 1000.0, 0.05)
         density_group.addRow("New face density", self.face_density)
@@ -182,6 +200,7 @@ class TPMSTaskPanel:
 
         self.surface.currentTextChanged.connect(self._surface_changed)
         self.density_mode.currentTextChanged.connect(self._update_density_controls)
+        self.density_gradient.currentTextChanged.connect(self._update_density_controls)
         self.add_face_controls.clicked.connect(self._add_selected_face_controls)
         self.boundary_select.clicked.connect(self._use_selected_boundary)
         self.origin_select.clicked.connect(self._use_selected_origin)
@@ -260,13 +279,51 @@ class TPMSTaskPanel:
         type_id = getattr(boundary, "TypeId", "")
         if type_id == "Part::Sphere" and hasattr(boundary, "Radius"):
             return "Analytical sphere"
+        spherical_radii = self._analytical_spherical_radii(boundary)
+        if len(spherical_radii) == 1:
+            return "Analytical sphere"
+        if len(spherical_radii) == 2:
+            return "Analytical hollow sphere"
         if type_id == "Part::Box" and all(hasattr(boundary, name) for name in ("Length", "Width", "Height")):
             return "Analytical box"
+        if type_id == "Part::Cylinder" and all(hasattr(boundary, name) for name in ("Radius", "Height")):
+            return "Analytical cylinder"
+        cylindrical_radii = self._analytical_cylindrical_radii(boundary)
+        if len(cylindrical_radii) == 1:
+            return "Analytical cylinder"
+        if len(cylindrical_radii) == 2:
+            return "Analytical tube"
         if hasattr(boundary, "Shape"):
             return "Tessellation signed-distance"
         if hasattr(boundary, "Mesh"):
             return "Tessellation signed-distance"
         return "Unsupported boundary"
+
+    def _analytical_cylindrical_radii(self, boundary):
+        shape = getattr(boundary, "Shape", None)
+        if shape is None or shape.isNull():
+            return []
+        radii = []
+        for face in shape.Faces:
+            surface = face.Surface
+            if type(surface).__name__ == "Cylinder" and hasattr(surface, "Radius"):
+                radius = round(float(surface.Radius), 9)
+                if radius not in radii:
+                    radii.append(radius)
+        return radii
+
+    def _analytical_spherical_radii(self, boundary):
+        shape = getattr(boundary, "Shape", None)
+        if shape is None or shape.isNull():
+            return []
+        radii = []
+        for face in shape.Faces:
+            surface = face.Surface
+            if type(surface).__name__ == "Sphere" and hasattr(surface, "Radius"):
+                radius = round(float(surface.Radius), 9)
+                if radius not in radii:
+                    radii.append(radius)
+        return radii
 
     def _origin_text(self):
         origin_object = self._current_origin_object()
@@ -311,10 +368,13 @@ class TPMSTaskPanel:
 
     def _update_density_controls(self):
         enabled = self.density_mode.currentText() == "Non-uniform"
-        self.face_density.setEnabled(enabled)
-        self.density_transition.setEnabled(enabled)
-        self.face_controls_label.setEnabled(enabled)
-        self.add_face_controls.setEnabled(enabled)
+        face_enabled = enabled and self.density_gradient.currentText() in ("Selected-face distance field", "Face plane")
+        self.density_gradient.setEnabled(enabled)
+        self.density_count_mode.setEnabled(enabled)
+        self.face_density.setEnabled(face_enabled)
+        self.density_transition.setEnabled(face_enabled)
+        self.face_controls_label.setEnabled(face_enabled)
+        self.add_face_controls.setEnabled(face_enabled)
         self.face_controls_label.setText(self._face_controls_text())
 
     def _update_origin_controls(self):
@@ -485,7 +545,9 @@ class TPMSTaskPanel:
             obj.CellSize = App.Vector(self.cell_x.value(), self.cell_y.value(), self.cell_z.value())
             obj.Phase = App.Vector(self.phase_x.value(), self.phase_y.value(), self.phase_z.value())
             obj.DensityMode = self.density_mode.currentText()
+            obj.DensityGradient = self.density_gradient.currentText()
             obj.BaseDensity = float(self.base_density.value())
+            obj.DensityCountMode = self.density_count_mode.currentText()
             obj.FaceDensity = float(self.face_density.value())
             obj.DensityTransition = float(self.density_transition.value())
             obj.OriginMode = self.origin_mode.currentText()
