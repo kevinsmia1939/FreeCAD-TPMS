@@ -1598,6 +1598,137 @@ def generate_polydata(
     raise ValueError("Unsupported TPMS part: {}".format(part))
 
 
+def generate_hybrid_polydata(
+    equation,
+    part=PART_SHEET,
+    cell_size=(1.0, 1.0, 1.0),
+    repeat_cell=(1, 1, 1),
+    resolution=32,
+    offset=0.3,
+    phase=(0.0, 0.0, 0.0),
+    boundary_mode=BOUNDARY_SELECTED_SOLID,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
+    origin=None,
+    origin_rotation=None,
+    base_density=1.0,
+    region_specs=None,
+    transition_controls=None,
+):
+    configure_vtk_smp()
+    region_specs = list(region_specs or [])
+    transition_controls = list(transition_controls or [])
+    grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
+        cell_size,
+        repeat_cell,
+        resolution,
+        phase,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        origin,
+        origin_rotation,
+        "Uniform",
+        base_density,
+        None,
+        DENSITY_COUNT_FOLLOW,
+        GRADIENT_FACE_DISTANCE,
+        "Uniform",
+        offset,
+        None,
+        GRADIENT_FACE_DISTANCE,
+        0,
+        HARMONIC_BOUNDARY_CONDUCTOR,
+    )
+
+    field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
+    if field.shape == ():
+        field = np.full(x.shape, float(field))
+    offset_field = np.full(field.shape, float(offset), dtype=float)
+    region_index = np.full(field.shape, -1, dtype=np.int32)
+    base_density = max(0.05, float(base_density))
+
+    fallback_resolution = max(wx.shape)
+    for spec in region_specs:
+        boundary = spec.get("boundary_object")
+        if boundary is None:
+            continue
+        try:
+            mask = _selected_boundary_field_signed_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) >= 0.0
+        except Exception:
+            mask = _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
+        if not np.any(mask):
+            continue
+        density = max(0.05, float(spec.get("base_density", base_density)))
+        scale = density / base_density
+        spec_x = x * scale
+        spec_y = y * scale
+        spec_z = z * scale
+        spec_field = np.asarray(evaluate_equation(str(spec.get("equation", equation)), spec_x, spec_y, spec_z), dtype=float)
+        if spec_field.shape == ():
+            spec_field = np.full(field.shape, float(spec_field))
+        if spec_field.shape == field.shape:
+            field[mask] = spec_field[mask]
+        offset_field[mask] = float(spec.get("offset", offset))
+        region_index[mask] = int(spec.get("index", -1))
+
+    for control in transition_controls:
+        source_index = int(control.get("source_index", -999999))
+        target_equation = str(control.get("target_equation", "")).strip()
+        if not target_equation:
+            continue
+        mask = region_index == source_index
+        if not np.any(mask):
+            continue
+        try:
+            distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            weight = _smooth_falloff_weight(distance, max(1e-9, float(control.get("transition", 1.0))))
+            weight = np.where(mask, weight, 0.0)
+            if not np.any(weight > 0.0):
+                continue
+            density = max(0.05, float(control.get("target_density", base_density)))
+            scale = density / base_density
+            target = np.asarray(evaluate_equation(target_equation, x * scale, y * scale, z * scale), dtype=float)
+            if target.shape == ():
+                target = np.full(field.shape, float(target))
+            if target.shape != field.shape:
+                continue
+            field = field + weight * (target - field)
+            if "target_offset" in control:
+                offset_field = offset_field + weight * (float(control["target_offset"]) - offset_field)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring hybrid TPMS transition control: {}\n".format(exc))
+
+    grid["surface"] = field.ravel(order="F")
+    grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
+    grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
+    has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
+
+    if not add_caps:
+        return _generate_uncapped_polydata(grid, part, has_boundary)
+    if part == PART_SHEET:
+        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
+            scalars="lower_surface",
+            invert=False,
+        )
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_UPPER:
+        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_LOWER:
+        volume = grid.clip_scalar(scalars="lower_surface")
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_SURFACE:
+        volume = grid.contour(isosurfaces=[0.0], scalars="surface")
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface().clean().triangulate()
+    raise ValueError("Unsupported TPMS part: {}".format(part))
+
+
 def generate_cylindrical_ring_polydata(
     equation,
     part=PART_SHEET,
@@ -2295,6 +2426,56 @@ def generate_freecad_mesh(
     except Exception:
         pass
     return combined
+
+
+def generate_hybrid_freecad_mesh(
+    equation,
+    part=PART_SHEET,
+    cell_size=(10.0, 10.0, 10.0),
+    repeat_cell=(1, 1, 1),
+    resolution=16,
+    offset=0.3,
+    phase=(0.0, 0.0, 0.0),
+    boundary_mode=BOUNDARY_SELECTED_SOLID,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
+    mesh_relaxation=False,
+    relax_iterations=5,
+    relax_skip_boundary=True,
+    relax_cap_surface=False,
+    origin=None,
+    origin_rotation=None,
+    base_density=1.0,
+    region_specs=None,
+    transition_controls=None,
+):
+    polydata = generate_hybrid_polydata(
+        equation,
+        part,
+        cell_size,
+        repeat_cell,
+        resolution,
+        offset,
+        phase,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        add_caps,
+        origin,
+        origin_rotation,
+        base_density,
+        region_specs,
+        transition_controls,
+    )
+    return _prepare_freecad_mesh(
+        polydata,
+        mesh_relaxation,
+        relax_iterations,
+        relax_skip_boundary,
+        relax_cap_surface,
+        add_caps,
+    )
 
 
 def add_tpms_mesh_to_document(

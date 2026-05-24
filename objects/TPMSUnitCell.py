@@ -847,56 +847,127 @@ def _clear_region_setting_links(obj):
 def _execute_per_region_meshes(base, primary_mesh_obj, tpms_generator):
     _sync_region_resolutions_from_base(base)
     items = boundary_region_items(getattr(base, "BoundaryObject", None))
-    meshes = _ensure_region_result_meshes(base, primary_mesh_obj, len(items))
-    total_facets = 0
-    any_non_manifold = False
-    all_solid = True
-    errors = []
+    _remove_extra_region_meshes(base, primary_mesh_obj)
+    try:
+        mesh = _generate_hybrid_mesh(base, items, tpms_generator)
+        errors = []
+    except Exception as exc:
+        mesh = Mesh.Mesh()
+        errors = [str(exc)]
+    primary_mesh_obj.Mesh = mesh
+    primary_mesh_obj.Label = "TPMS Mesh"
+    base.ResultMesh = primary_mesh_obj
+    base.ResultRegionMeshes = []
+    base.RegionCount = len(items)
+    base.RegionDescription = "Generated continuous hybrid mesh across {} solid region(s)".format(len(items))
+    base.FacetCount = int(mesh.CountFacets)
+    base.IsSolidMesh = bool(mesh.CountFacets > 0 and mesh.isSolid())
+    base.HasNonManifolds = bool(mesh.CountFacets > 0 and mesh.hasNonManifolds())
+    base.LastError = "; ".join(errors)
+    if errors:
+        App.Console.PrintError("TPMS hybrid generation failed: {}\n".format(base.LastError))
 
+
+def _remove_extra_region_meshes(base, primary_mesh_obj):
+    doc = base.Document
+    for mesh in list(getattr(base, "ResultRegionMeshes", [])):
+        if mesh is None or mesh is primary_mesh_obj:
+            continue
+        try:
+            doc.removeObject(mesh.Name)
+        except Exception:
+            try:
+                mesh.Mesh = Mesh.Mesh()
+                if getattr(mesh, "ViewObject", None) is not None:
+                    mesh.ViewObject.Visibility = False
+            except Exception:
+                pass
+    base.ResultRegionMeshes = []
+
+
+def _generate_hybrid_mesh(base, items, tpms_generator):
+    resolution = max(4, int(getattr(base, "Resolution", 16)))
+    cell_size = _vector_tuple(getattr(base, "CellSize", App.Vector(10.0, 10.0, 10.0)), fallback=(10.0, 10.0, 10.0), minimum=1e-9)
+    phase = _vector_tuple(getattr(base, "Phase", App.Vector(0.0, 0.0, 0.0)), fallback=(0.0, 0.0, 0.0), minimum=None)
+    region_specs = _hybrid_region_specs(base, items)
+    transition_controls = _hybrid_transition_controls(base, items)
+    return tpms_generator.generate_hybrid_freecad_mesh(
+        str(getattr(base, "Equation", "")),
+        str(getattr(base, "Part", tpms_generator.PART_SHEET)),
+        cell_size,
+        (1, 1, 1),
+        resolution,
+        float(getattr(base, "Offset", 0.3)),
+        phase,
+        tpms_generator.BOUNDARY_SELECTED_SOLID,
+        getattr(base, "BoundaryObject", None),
+        max(0.0, float(getattr(base, "Sampling", 0.0))),
+        bool(getattr(base, "AddCaps", True)),
+        bool(getattr(base, "MeshRelaxation", False)),
+        max(0, int(getattr(base, "RelaxIterations", 5))),
+        bool(getattr(base, "RelaxSkipBoundary", True)),
+        bool(getattr(base, "RelaxCapSurface", False)),
+        _origin_tuple(base),
+        _origin_rotation(base),
+        max(0.05, float(getattr(base, "BaseDensity", 1.0))),
+        region_specs,
+        transition_controls,
+    )
+
+
+def _hybrid_region_specs(base, items):
+    specs = []
+    for item in items:
+        setting = _region_generation_setting(base, int(item["index"]))
+        source = _transition_endpoint_controller(setting, "source") if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION else setting
+        if source is None:
+            source = setting
+        specs.append(
+            {
+                "index": int(item["index"]),
+                "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
+                "equation": str(getattr(source, "Equation", getattr(base, "Equation", ""))),
+                "offset": float(getattr(source, "Offset", getattr(base, "Offset", 0.3))),
+                "base_density": max(0.05, float(getattr(source, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
+            }
+        )
+    return specs
+
+
+def _hybrid_transition_controls(base, items):
+    controls = []
     for item in items:
         index = int(item["index"])
         setting = _region_generation_setting(base, index)
-        mesh_obj = meshes[index]
-        try:
-            mesh = _generate_region_mesh(base, setting, item, items, tpms_generator)
-        except Exception as exc:
-            mesh = Mesh.Mesh()
-            errors.append("Region {}: {}".format(index + 1, exc))
-        mesh_obj.Mesh = mesh
-        mesh_obj.Label = "TPMS Mesh Region {}".format(index + 1)
-        total_facets += int(mesh.CountFacets)
-        if int(mesh.CountFacets) > 0:
-            all_solid = all_solid and bool(mesh.isSolid())
-            any_non_manifold = any_non_manifold or bool(mesh.hasNonManifolds())
-
-    base.ResultRegionMeshes = meshes
-    base.RegionCount = len(items)
-    base.RegionDescription = "Generated {} solid region mesh(es)".format(len(items))
-    base.FacetCount = int(total_facets)
-    base.IsSolidMesh = bool(total_facets > 0 and all_solid)
-    base.HasNonManifolds = bool(any_non_manifold)
-    base.LastError = "; ".join(errors)
-    if errors:
-        App.Console.PrintError("TPMS region generation failed: {}\n".format(base.LastError))
-
-
-def _ensure_region_result_meshes(base, primary_mesh_obj, count):
-    doc = base.Document
-    container = _container_for(base)
-    meshes = list(getattr(base, "ResultRegionMeshes", []))
-    ordered = []
-    if primary_mesh_obj is not None:
-        ordered.append(primary_mesh_obj)
-    for mesh in meshes:
-        if mesh is not None and mesh not in ordered:
-            ordered.append(mesh)
-    while len(ordered) < int(count):
-        mesh = doc.addObject("Mesh::Feature", "TPMS_Mesh_Region_{}".format(len(ordered) + 1))
-        mesh.Label = "TPMS Mesh Region {}".format(len(ordered) + 1)
-        if container is not None:
-            container.addObject(mesh)
-        ordered.append(mesh)
-    return ordered[: int(count)]
+        for other in items:
+            other_index = int(other["index"])
+            if other_index == index:
+                continue
+            other_setting = _region_generation_setting(base, other_index)
+            if _same_tpms_region_settings(setting, other_setting):
+                continue
+            width = _shared_transition_width(base, index, other_index)
+            for face in _faces_touching_solid(item["solid"], other["solid"]):
+                try:
+                    point, normal = _face_point_normal(face)
+                    surface = _face_surface_mesh(face)
+                except Exception:
+                    continue
+                controls.append(
+                    {
+                        "type": "face_distance",
+                        "source_index": index,
+                        "target_index": other_index,
+                        "point": point,
+                        "normal": normal,
+                        "surface": surface,
+                        "transition": width,
+                        "target_equation": str(getattr(other_setting, "Equation", getattr(base, "Equation", ""))),
+                        "target_density": max(0.05, float(getattr(other_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
+                        "target_offset": float(getattr(other_setting, "Offset", getattr(base, "Offset", 0.3))),
+                    }
+                )
+    return controls
 
 
 def _region_generation_setting(base, region_index):

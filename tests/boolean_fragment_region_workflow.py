@@ -185,24 +185,24 @@ def run_file(path):
             )
 
         base_description = str(getattr(controller, "RegionDescription", ""))
-        if not base_description.startswith("Generated {} solid region mesh".format(len(regions))):
+        if not base_description.startswith("Generated continuous hybrid mesh across {} solid region".format(len(regions))):
             raise RuntimeError(
-                "{} base controller did not generate per-region meshes: {}".format(path, base_description)
+                "{} base controller did not generate a continuous hybrid mesh: {}".format(path, base_description)
             )
 
         region_meshes = list(getattr(controller, "ResultRegionMeshes", []))
-        if len(region_meshes) != len(regions):
-            raise RuntimeError("{} has {} result meshes for {} regions".format(path, len(region_meshes), len(regions)))
-        region_facets = [int(mesh.Mesh.CountFacets) for mesh in region_meshes]
-        if any(facets <= 0 for facets in region_facets):
-            raise RuntimeError("{} generated empty per-region mesh facets {}".format(path, region_facets))
+        if region_meshes:
+            raise RuntimeError("{} generated {} per-region meshes instead of one continuous mesh".format(path, len(region_meshes)))
+        main_facets = _mesh_facet_count(controller)
+        if main_facets <= 0:
+            raise RuntimeError("{} generated an empty continuous mesh".format(path))
         print(
-            "PASS {} regions={} created={} transition_controls={} region_facets={} main_region='{}' main_bounds={}".format(
+            "PASS {} regions={} created={} transition_controls={} main_facets={} main_region='{}' main_bounds={}".format(
                 os.path.basename(path),
                 len(regions),
                 len(created),
                 transition_control_count,
-                region_facets,
+                main_facets,
                 base_description,
                 tuple(round(value, 6) for value in _mesh_bounds(controller.ResultMesh)) if _mesh_facet_count(controller) else (),
             )
