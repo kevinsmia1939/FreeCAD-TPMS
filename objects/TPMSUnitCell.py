@@ -545,6 +545,8 @@ class TPMSUnitCell:
         if region_role_added and str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE:
             obj.RegionRole = REGION_ROLE_OVERRIDE
         _sync_resolution_editor_mode(obj)
+        if _is_region_setting(obj):
+            _clear_region_setting_links(obj)
 
     def onDocumentRestored(self, obj):
         self._add_properties(obj)
@@ -573,16 +575,17 @@ class TPMSUnitCell:
     def execute(self, obj):
         import tpms_generator
 
-        mesh_obj = getattr(obj, "ResultMesh", None)
-        if mesh_obj is None:
-            mesh_obj = obj.Document.addObject("Mesh::Feature", "TPMS_Mesh")
-            mesh_obj.Label = "TPMS Mesh"
-            obj.ResultMesh = mesh_obj
-
         try:
             if _is_region_setting(obj):
                 _clear_region_setting_mesh(obj)
                 return
+
+            mesh_obj = getattr(obj, "ResultMesh", None)
+            if mesh_obj is None:
+                mesh_obj = obj.Document.addObject("Mesh::Feature", "TPMS_Mesh")
+                mesh_obj.Label = "TPMS Mesh"
+                obj.ResultMesh = mesh_obj
+
             if _uses_per_region_meshes(obj):
                 _execute_per_region_meshes(obj, mesh_obj, tpms_generator)
                 return
@@ -820,17 +823,25 @@ def _uses_per_region_meshes(obj):
 
 
 def _clear_region_setting_mesh(obj):
-    mesh_obj = getattr(obj, "ResultMesh", None)
-    if mesh_obj is not None:
-        mesh_obj.Mesh = Mesh.Mesh()
-        try:
-            mesh_obj.Label = "{} Mesh (settings only)".format(obj.Label)
-        except Exception:
-            pass
+    _clear_region_setting_links(obj)
     obj.FacetCount = 0
     obj.IsSolidMesh = False
     obj.HasNonManifolds = False
     obj.LastError = ""
+
+
+def _clear_region_setting_links(obj):
+    mesh_obj = getattr(obj, "ResultMesh", None)
+    if mesh_obj is not None:
+        try:
+            obj.ResultMesh = None
+        except Exception:
+            pass
+    if hasattr(obj, "ResultRegionMeshes"):
+        try:
+            obj.ResultRegionMeshes = []
+        except Exception:
+            pass
 
 
 def _execute_per_region_meshes(base, primary_mesh_obj, tpms_generator):
@@ -1722,6 +1733,8 @@ def _touch_linked_tpms_controllers(control):
             controller.touch()
         except Exception:
             pass
+        if _is_region_setting(controller):
+            continue
         mesh = getattr(controller, "ResultMesh", None)
         if mesh is not None:
             try:
