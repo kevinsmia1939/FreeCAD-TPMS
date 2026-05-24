@@ -86,3 +86,6 @@ generation, cylindrical ring origin handling, and basic mesh validity.
   against the selected boundary.
 - `example/example1.FCStd` and `example/screenshot.png` show a multi-region TPMS
   setup in FreeCAD.
+
+## License
+GPL-3.0 license
