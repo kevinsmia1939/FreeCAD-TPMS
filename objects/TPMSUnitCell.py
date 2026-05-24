@@ -1,9 +1,16 @@
 import FreeCAD as App
+import Mesh
 import Part
 
 
 REGION_MODE_ALL = "All regions"
 REGION_MODE_SINGLE = "Single region"
+REGION_ROLE_BASE = "Base"
+REGION_ROLE_OVERRIDE = "Override"
+REGION_ROLE_TRANSITION = "Transition"
+TRANSITION_MODE_NONE = "None"
+TRANSITION_MODE_SHARED_FACE = "Shared face"
+TRANSITION_MODE_BRIDGE_REGION = "Bridge region"
 
 
 def make_tpms_unit_cell(doc=None):
@@ -63,6 +70,12 @@ def make_tpms_unit_cell(doc=None):
     controller.BoundaryMode = tpms_generator.BOUNDARY_BOX
     controller.RegionMode = REGION_MODE_ALL
     controller.RegionIndex = 0
+    controller.RegionRole = REGION_ROLE_BASE
+    controller.BaseExcludesRegionSettings = True
+    controller.TransitionMode = TRANSITION_MODE_NONE
+    controller.TransitionWidth = 0.0
+    controller.TransitionSourceRegion = 0
+    controller.TransitionTargetRegion = 0
     controller.Sampling = 0.0
     controller.AddCaps = True
     controller.MeshRelaxation = False
@@ -133,6 +146,9 @@ def _make_region_controller(doc, container):
 def _configure_region_controller(source_controller, controller, region_index):
     controller.RegionMode = REGION_MODE_SINGLE
     controller.RegionIndex = int(region_index)
+    controller.RegionRole = REGION_ROLE_OVERRIDE
+    controller.BaseExcludesRegionSettings = True
+    controller.TransitionMode = TRANSITION_MODE_NONE
     controller.RegionDescription = _region_label_for_index(getattr(source_controller, "BoundaryObject", None), region_index)
     controller.Label = "TPMS Region {}".format(int(region_index) + 1)
     mesh_obj = getattr(controller, "ResultMesh", None)
@@ -221,6 +237,25 @@ def _existing_region_indices(source_controller):
     return used
 
 
+def _region_setting_indices(controller, roles=None):
+    boundary = getattr(controller, "BoundaryObject", None)
+    container = _container_for(controller)
+    roles = set(roles or (REGION_ROLE_OVERRIDE, REGION_ROLE_TRANSITION))
+    indices = set()
+    for obj in getattr(controller.Document, "Objects", []):
+        if obj is controller or not is_tpms_unit_cell(obj):
+            continue
+        if container is not None and _container_for(obj) != container:
+            continue
+        if getattr(obj, "BoundaryObject", None) != boundary:
+            continue
+        if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE:
+            continue
+        if str(getattr(obj, "RegionRole", REGION_ROLE_OVERRIDE)) in roles:
+            indices.add(int(getattr(obj, "RegionIndex", 0)))
+    return indices
+
+
 def _region_label_for_index(boundary_object, region_index):
     index = int(region_index)
     for item in boundary_region_items(boundary_object):
@@ -239,6 +274,7 @@ class TPMSUnitCell:
     def _add_properties(self, obj):
         import tpms_generator
 
+        region_role_added = not hasattr(obj, "RegionRole")
         if not hasattr(obj, "Surface"):
             obj.addProperty("App::PropertyEnumeration", "Surface", "TPMS", "Preset TPMS equation")
             obj.Surface = tpms_generator.surface_names() + ["Custom"]
@@ -376,6 +412,26 @@ class TPMSUnitCell:
         if not hasattr(obj, "RegionIndex"):
             obj.addProperty("App::PropertyInteger", "RegionIndex", "TPMS", "Zero-based solid region index inside a multi-solid boundary")
             obj.RegionIndex = 0
+        if not hasattr(obj, "RegionRole"):
+            obj.addProperty("App::PropertyEnumeration", "RegionRole", "TPMS", "How this TPMS setting participates in multi-region generation")
+            obj.RegionRole = [REGION_ROLE_BASE, REGION_ROLE_OVERRIDE, REGION_ROLE_TRANSITION]
+            obj.RegionRole = REGION_ROLE_BASE
+        if not hasattr(obj, "BaseExcludesRegionSettings"):
+            obj.addProperty("App::PropertyBool", "BaseExcludesRegionSettings", "TPMS", "Base all-region generation skips regions with override or transition settings")
+            obj.BaseExcludesRegionSettings = True
+        if not hasattr(obj, "TransitionMode"):
+            obj.addProperty("App::PropertyEnumeration", "TransitionMode", "Transition", "How transition TPMS is defined")
+            obj.TransitionMode = [TRANSITION_MODE_NONE, TRANSITION_MODE_SHARED_FACE, TRANSITION_MODE_BRIDGE_REGION]
+            obj.TransitionMode = TRANSITION_MODE_NONE
+        if not hasattr(obj, "TransitionWidth"):
+            obj.addProperty("App::PropertyFloat", "TransitionWidth", "Transition", "Transition width near shared region faces")
+            obj.TransitionWidth = 0.0
+        if not hasattr(obj, "TransitionSourceRegion"):
+            obj.addProperty("App::PropertyInteger", "TransitionSourceRegion", "Transition", "Source region index for bridge transition")
+            obj.TransitionSourceRegion = 0
+        if not hasattr(obj, "TransitionTargetRegion"):
+            obj.addProperty("App::PropertyInteger", "TransitionTargetRegion", "Transition", "Target region index for bridge transition")
+            obj.TransitionTargetRegion = 0
         if not hasattr(obj, "RegionCount"):
             obj.addProperty("App::PropertyInteger", "RegionCount", "Result", "Detected solid region count in the boundary")
             obj.setEditorMode("RegionCount", 1)
@@ -417,6 +473,8 @@ class TPMSUnitCell:
         for prop in ("RepeatX", "RepeatY", "RepeatZ", "MeshStitching"):
             if hasattr(obj, prop):
                 obj.setEditorMode(prop, 2)
+        if region_role_added and str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE:
+            obj.RegionRole = REGION_ROLE_OVERRIDE
 
     def onDocumentRestored(self, obj):
         self._add_properties(obj)
@@ -451,6 +509,13 @@ class TPMSUnitCell:
             boundary_object, region_description, region_count = selected_boundary_region(obj)
             obj.RegionCount = int(region_count)
             obj.RegionDescription = region_description
+            if boundary_object is None and str(getattr(obj, "BoundaryMode", "")) == tpms_generator.BOUNDARY_SELECTED_SOLID:
+                mesh_obj.Mesh = Mesh.Mesh()
+                obj.FacetCount = 0
+                obj.IsSolidMesh = False
+                obj.HasNonManifolds = False
+                obj.LastError = ""
+                return
             mesh = tpms_generator.generate_freecad_mesh(
                 obj.Equation,
                 str(obj.Part),
@@ -601,13 +666,26 @@ def selected_boundary_region(controller):
     items = boundary_region_items(boundary)
     if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE or len(items) <= 1:
         if len(items) > 1:
+            active_items = items
+            skipped = set()
+            if (
+                str(getattr(controller, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_BASE
+                and bool(getattr(controller, "BaseExcludesRegionSettings", True))
+            ):
+                skipped = _region_setting_indices(controller)
+                active_items = [item for item in items if int(item["index"]) not in skipped]
+            if not active_items:
+                return None, "Base has no unassigned regions; {} region setting(s) cover all regions".format(len(skipped)), len(items)
+            description = "All {} regions".format(len(active_items))
+            if skipped:
+                description = "{}; skipped {} override/transition region(s)".format(description, len(skipped))
             return (
                 _ShapeBoundaryAdapter(
                     boundary.Shape,
-                    "All {} regions".format(len(items)),
-                    [item["solid"] for item in items],
+                    description,
+                    [item["solid"] for item in active_items],
                 ),
-                "All {} regions".format(len(items)),
+                description,
                 len(items),
             )
         if len(items) == 1:

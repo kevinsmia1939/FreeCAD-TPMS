@@ -32,7 +32,7 @@ class AddTPMSRegionCommand:
         import os
 
         return {
-            "Pixmap": os.path.join(_mod_path(), "icons", "TPMSAssembler.svg"),
+            "Pixmap": os.path.join(_mod_path(), "icons", "TPMSRegion.svg"),
             "MenuText": "Add TPMS Region Settings",
             "ToolTip": "Add another TPMS parameter object for one solid region of a multi-region boundary.",
         }

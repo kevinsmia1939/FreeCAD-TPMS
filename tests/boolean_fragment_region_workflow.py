@@ -1,7 +1,7 @@
 """Headless BooleanFragments region workflow smoke test.
 
 Run with:
-    FreeCADCmd tests/boolean_fragment_region_workflow.py
+    FreeCADCmd -c "import runpy; runpy.run_path('tests/boolean_fragment_region_workflow.py', run_name='__main__')"
 """
 
 import os
@@ -16,6 +16,9 @@ import FreeCAD as App
 
 import tpms_generator
 from objects.TPMSUnitCell import (
+    REGION_ROLE_BASE,
+    REGION_ROLE_OVERRIDE,
+    REGION_ROLE_TRANSITION,
     REGION_MODE_ALL,
     add_tpms_region_settings_for_all_regions,
     boundary_region_items,
@@ -77,6 +80,17 @@ def _mesh_bounds(mesh_obj):
     return (bb.XMin, bb.XMax, bb.YMin, bb.YMax, bb.ZMin, bb.ZMax)
 
 
+def _mesh_facet_count(controller):
+    mesh_obj = getattr(controller, "ResultMesh", None)
+    if mesh_obj is None:
+        return 0
+    return int(mesh_obj.Mesh.CountFacets)
+
+
+def _role(controller):
+    return str(getattr(controller, "RegionRole", REGION_ROLE_BASE))
+
+
 def run_file(path):
     doc = App.openDocument(path)
     try:
@@ -113,17 +127,48 @@ def run_file(path):
             last_error = str(getattr(obj, "LastError", ""))
             if last_error:
                 raise RuntimeError("{} generation failed: {}".format(obj.Label, last_error))
-            mesh_obj = getattr(obj, "ResultMesh", None)
-            if mesh_obj is None or mesh_obj.Mesh.CountFacets <= 0:
+
+            facets = _mesh_facet_count(obj)
+            role = _role(obj)
+            description = str(getattr(obj, "RegionDescription", ""))
+            base_can_be_empty = (
+                obj is controller
+                and role == REGION_ROLE_BASE
+                and description.startswith("Base has no unassigned regions")
+            )
+            if facets <= 0 and not base_can_be_empty:
                 raise RuntimeError("{} generated an empty mesh".format(obj.Label))
 
+        covered_regions = {
+            int(getattr(obj, "RegionIndex", 0))
+            for obj in single_region
+            if _role(obj) in (REGION_ROLE_OVERRIDE, REGION_ROLE_TRANSITION)
+        }
+        if not set(range(len(regions))).issubset(covered_regions):
+            raise RuntimeError(
+                "{} region override coverage is incomplete: {} of {}".format(
+                    path,
+                    sorted(covered_regions),
+                    list(range(len(regions))),
+                )
+            )
+
+        base_description = str(getattr(controller, "RegionDescription", ""))
+        if len(covered_regions) >= len(regions) and not base_description.startswith("Base has no unassigned regions"):
+            raise RuntimeError(
+                "{} base controller did not skip covered regions: {}".format(path, base_description)
+            )
+
+        override_facets = sum(_mesh_facet_count(obj) for obj in single_region)
         print(
-            "PASS {} regions={} created={} main_facets={} main_bounds={}".format(
+            "PASS {} regions={} created={} main_facets={} override_facets={} main_region='{}' main_bounds={}".format(
                 os.path.basename(path),
                 len(regions),
                 len(created),
-                controller.ResultMesh.Mesh.CountFacets,
-                tuple(round(value, 6) for value in _mesh_bounds(controller.ResultMesh)),
+                _mesh_facet_count(controller),
+                override_facets,
+                base_description,
+                tuple(round(value, 6) for value in _mesh_bounds(controller.ResultMesh)) if _mesh_facet_count(controller) else (),
             )
         )
     finally:
