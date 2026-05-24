@@ -317,6 +317,102 @@ def run_generated_transition_region_case():
         App.closeDocument(doc.Name)
 
 
+def run_hybrid_region_grading_overlay_case():
+    import Part
+
+    box1 = Part.makeBox(10.0, 10.0, 10.0)
+    box2 = Part.makeBox(10.0, 10.0, 10.0, App.Vector(10.0, 0.0, 0.0))
+    outer = box1.fuse(box2)
+    base_kwargs = {
+        "equation": tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        "part": tpms_generator.PART_SHEET,
+        "cell_size": (10.0, 10.0, 10.0),
+        "repeat_cell": (1, 1, 1),
+        "resolution": 8,
+        "offset": 0.35,
+        "boundary_mode": tpms_generator.BOUNDARY_SELECTED_SOLID,
+        "boundary_object": _BoundaryProbe(outer),
+        "add_caps": False,
+        "base_density": 1.0,
+        "region_specs": [
+            {
+                "index": 0,
+                "boundary_object": _BoundaryProbe(box1),
+                "equation": tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+                "offset": 0.35,
+                "base_density": 1.0,
+            },
+            {
+                "index": 1,
+                "boundary_object": _BoundaryProbe(box2),
+                "equation": tpms_generator.SURFACE_EQUATIONS["Schwarz P"],
+                "offset": 0.35,
+                "base_density": 1.0,
+            },
+        ],
+    }
+    baseline = tpms_generator.generate_hybrid_polydata(**base_kwargs)
+    unit_cell_graded = tpms_generator.generate_hybrid_polydata(
+        **base_kwargs,
+        density_mode="Non-uniform",
+        density_controls=[
+            {
+                "type": "face_plane",
+                "point": (10.0, 0.0, 0.0),
+                "normal": (1.0, 0.0, 0.0),
+                "density": 2.0,
+                "transition": 12.0,
+            }
+        ],
+        density_gradient=tpms_generator.GRADIENT_FACE_PLANE,
+    )
+    region_scoped_graded = tpms_generator.generate_hybrid_polydata(
+        **base_kwargs,
+        density_mode="Non-uniform",
+        density_controls=[
+            {
+                "type": "face_plane",
+                "point": (10.0, 0.0, 0.0),
+                "normal": (1.0, 0.0, 0.0),
+                "density": 2.0,
+                "transition": 12.0,
+                "affected_regions": [1],
+            }
+        ],
+        density_gradient=tpms_generator.GRADIENT_FACE_PLANE,
+    )
+    thickness_graded = tpms_generator.generate_hybrid_polydata(
+        **base_kwargs,
+        density_offset_mode="Non-uniform",
+        density_offset_controls=[
+            {
+                "type": "face_plane",
+                "point": (10.0, 0.0, 0.0),
+                "normal": (1.0, 0.0, 0.0),
+                "offset": 0.8,
+                "transition": 12.0,
+            }
+        ],
+        density_offset_gradient=tpms_generator.GRADIENT_FACE_PLANE,
+    )
+    if baseline.n_points <= 0 or unit_cell_graded.n_points <= 0 or region_scoped_graded.n_points <= 0 or thickness_graded.n_points <= 0:
+        raise RuntimeError("Hybrid region grading overlay generated an empty mesh")
+    if unit_cell_graded.n_cells == baseline.n_cells:
+        raise RuntimeError("Unit-cell grading overlay did not affect hybrid region generation")
+    if region_scoped_graded.n_cells == unit_cell_graded.n_cells:
+        raise RuntimeError("Region-scoped unit-cell grading behaved the same as all-region grading")
+    if thickness_graded.n_cells == baseline.n_cells:
+        raise RuntimeError("Thickness grading overlay did not affect hybrid region generation")
+    print(
+        "PASS hybrid_region_grading_overlay base_cells={} unit_cell_cells={} scoped_cells={} thickness_cells={}".format(
+            baseline.n_cells,
+            unit_cell_graded.n_cells,
+            region_scoped_graded.n_cells,
+            thickness_graded.n_cells,
+        )
+    )
+
+
 def run_cylindrical_ring_boundary_origin_case():
     import Part
 
@@ -412,6 +508,7 @@ def main():
     for name in TEST_FILES:
         run_file(os.path.join(STUDY_DIR, name))
     run_generated_transition_region_case()
+    run_hybrid_region_grading_overlay_case()
     run_cylindrical_ring_boundary_origin_case()
 
 

@@ -19,6 +19,8 @@ SURFACE_EQUATIONS = {
     "Lidinoid": "0.5 * (sin(2*x) * cos(y) * sin(z) + sin(2*y) * cos(z) * sin(x) + sin(2*z) * cos(x) * sin(y)) - 0.5 * (cos(2*x) * cos(2*y) + cos(2*y) * cos(2*z) + cos(2*z) * cos(2*x)) + 0.3",
 }
 
+SURFACE_EMPTY = "Empty"
+SURFACE_SOLID_FILL = "Solid fill"
 
 PART_SHEET = "Sheet"
 PART_UPPER = "Upper skeletal"
@@ -69,7 +71,7 @@ SAFE_NAMES = {
 
 
 def surface_names():
-    return list(SURFACE_EQUATIONS)
+    return list(SURFACE_EQUATIONS) + [SURFACE_EMPTY, SURFACE_SOLID_FILL]
 
 
 def evaluate_equation(equation, x, y, z):
@@ -404,6 +406,89 @@ def _offset_field(
         weight = 1.0 - smooth
         offset += weight * (target - base_offset)
     return offset
+
+
+def _apply_scalar_grading_field(
+    base_field,
+    wx,
+    wy,
+    wz,
+    mode,
+    controls,
+    gradient,
+    boundary_mode,
+    boundary_object,
+    sampling,
+    value_key,
+    minimum=None,
+    region_index=None,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+):
+    field = np.asarray(base_field, dtype=float).copy()
+    if str(mode) != "Non-uniform" or not controls:
+        return field if minimum is None else np.maximum(field, float(minimum))
+
+    if str(gradient) == GRADIENT_HARMONIC:
+        reference = float(np.median(field))
+        solved = _harmonic_interpolated_field(
+            wx,
+            wy,
+            wz,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            controls,
+            reference,
+            value_key,
+            minimum=minimum,
+            grading_resolution=grading_resolution,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+        graded = field + (solved - reference)
+        return graded if minimum is None else np.maximum(graded, float(minimum))
+
+    for control in controls:
+        try:
+            scope_mask = _grading_scope_mask(control, field.shape, region_index)
+            if not np.any(scope_mask):
+                continue
+            target = float(control.get(value_key, np.nan))
+            if not np.isfinite(target):
+                continue
+            transition = max(1e-9, float(control.get("transition", 1.0)))
+            if control.get("type", "face_plane") == "face_distance":
+                distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            else:
+                point = np.asarray(control["point"], dtype=float)
+                normal = np.asarray(control["normal"], dtype=float)
+                normal_length = float(np.linalg.norm(normal))
+                if normal_length <= 1e-12:
+                    continue
+                normal = normal / normal_length
+                distance = np.abs(
+                    (wx - point[0]) * normal[0]
+                    + (wy - point[1]) * normal[1]
+                    + (wz - point[2]) * normal[2]
+                )
+            weight = _smooth_falloff_weight(distance, transition)
+            weight = np.where(scope_mask, weight, 0.0)
+            field = field + weight * (target - field)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring TPMS scalar grading control: {}\n".format(exc))
+    return field if minimum is None else np.maximum(field, float(minimum))
+
+
+def _grading_scope_mask(control, shape, region_index):
+    affected = control.get("affected_regions")
+    if not affected:
+        return np.ones(shape, dtype=bool)
+    if region_index is None:
+        return np.ones(shape, dtype=bool)
+    indices = {int(value) for value in affected}
+    if not indices:
+        return np.ones(shape, dtype=bool)
+    return np.isin(region_index, list(indices))
 
 
 def _apply_face_distance_offset_field(offset, wx, wy, wz, control, base_offset):
@@ -1647,6 +1732,14 @@ def generate_hybrid_polydata(
     region_specs=None,
     transition_controls=None,
     transition_region_specs=None,
+    density_mode="Uniform",
+    density_controls=None,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     configure_vtk_smp()
     region_specs = list(region_specs or [])
@@ -1679,8 +1772,11 @@ def generate_hybrid_polydata(
     if field.shape == ():
         field = np.full(x.shape, float(field))
     offset_field = np.full(field.shape, float(offset), dtype=float)
+    density_field = np.full(field.shape, base_density, dtype=float)
     region_index = np.full(field.shape, -1, dtype=np.int32)
     base_density = max(0.05, float(base_density))
+    region_masks = []
+    transition_masks = []
 
     fallback_resolution = max(wx.shape)
     def boundary_mask(boundary):
@@ -1696,10 +1792,9 @@ def generate_hybrid_polydata(
             mask = _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
             return np.where(mask, 0.0, np.inf)
 
-    def evaluated_field(spec, equation_key="equation", density_key="base_density"):
-        density = max(0.05, float(spec.get(density_key, base_density)))
-        scale = density / base_density
-        values = np.asarray(evaluate_equation(str(spec.get(equation_key, equation)), x * scale, y * scale, z * scale), dtype=float)
+    def evaluated_equation(equation_text, density_values):
+        scale = np.maximum(np.asarray(density_values, dtype=float), 0.05) / base_density
+        values = np.asarray(evaluate_equation(str(equation_text), x * scale, y * scale, z * scale), dtype=float)
         if values.shape == ():
             values = np.full(field.shape, float(values))
         return values
@@ -1711,11 +1806,10 @@ def generate_hybrid_polydata(
         mask = boundary_mask(boundary)
         if not np.any(mask):
             continue
-        spec_field = evaluated_field(spec)
-        if spec_field.shape == field.shape:
-            field[mask] = spec_field[mask]
         offset_field[mask] = float(spec.get("offset", offset))
+        density_field[mask] = max(0.05, float(spec.get("base_density", base_density)))
         region_index[mask] = int(spec.get("index", -1))
+        region_masks.append((spec, mask))
 
     for spec in transition_region_specs:
         boundary = spec.get("boundary_object")
@@ -1725,10 +1819,6 @@ def generate_hybrid_polydata(
             continue
         mask = boundary_mask(boundary)
         if not np.any(mask):
-            continue
-        source_field = evaluated_field(spec, "source_equation", "source_base_density")
-        target_field = evaluated_field(spec, "target_equation", "target_base_density")
-        if source_field.shape != field.shape or target_field.shape != field.shape:
             continue
         source_distance = boundary_distance(source_boundary)
         target_distance = boundary_distance(target_boundary)
@@ -1740,11 +1830,61 @@ def generate_hybrid_polydata(
             where=np.isfinite(denom) & (denom > 1e-12),
         )
         t = _smoothstep(np.clip(t, 0.0, 1.0))
-        field[mask] = ((1.0 - t) * source_field + t * target_field)[mask]
         source_offset = float(spec.get("source_offset", offset))
         target_offset = float(spec.get("target_offset", offset))
         offset_field[mask] = ((1.0 - t) * source_offset + t * target_offset)[mask]
+        source_density = max(0.05, float(spec.get("source_base_density", base_density)))
+        target_density = max(0.05, float(spec.get("target_base_density", base_density)))
+        density_field[mask] = ((1.0 - t) * source_density + t * target_density)[mask]
         region_index[mask] = int(spec.get("index", -1))
+        transition_masks.append((spec, mask, t))
+
+    density_field = _apply_scalar_grading_field(
+        density_field,
+        wx,
+        wy,
+        wz,
+        density_mode,
+        density_controls,
+        density_gradient,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        "density",
+        minimum=0.05,
+        region_index=region_index,
+        grading_resolution=grading_resolution,
+        harmonic_boundary_condition=harmonic_boundary_condition,
+    )
+    offset_field = _apply_scalar_grading_field(
+        offset_field,
+        wx,
+        wy,
+        wz,
+        density_offset_mode,
+        density_offset_controls,
+        density_offset_gradient,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        "offset",
+        minimum=None,
+        region_index=region_index,
+        grading_resolution=grading_resolution,
+        harmonic_boundary_condition=harmonic_boundary_condition,
+    )
+
+    field = evaluated_equation(equation, density_field)
+    for spec, mask in region_masks:
+        spec_field = evaluated_equation(str(spec.get("equation", equation)), density_field)
+        if spec_field.shape == field.shape:
+            field[mask] = spec_field[mask]
+    for spec, mask, t in transition_masks:
+        source_field = evaluated_equation(str(spec.get("source_equation", equation)), density_field)
+        target_field = evaluated_equation(str(spec.get("target_equation", equation)), density_field)
+        if source_field.shape != field.shape or target_field.shape != field.shape:
+            continue
+        field[mask] = ((1.0 - t) * source_field + t * target_field)[mask]
 
     for control in transition_controls:
         source_index = int(control.get("source_index", -999999))
@@ -2525,6 +2665,14 @@ def generate_hybrid_freecad_mesh(
     region_specs=None,
     transition_controls=None,
     transition_region_specs=None,
+    density_mode="Uniform",
+    density_controls=None,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     polydata = generate_hybrid_polydata(
         equation,
@@ -2544,6 +2692,14 @@ def generate_hybrid_freecad_mesh(
         region_specs,
         transition_controls,
         transition_region_specs,
+        density_mode,
+        density_controls,
+        density_gradient,
+        density_offset_mode,
+        density_offset_controls,
+        density_offset_gradient,
+        grading_resolution,
+        harmonic_boundary_condition,
     )
     return _prepare_freecad_mesh(
         polydata,

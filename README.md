@@ -25,11 +25,16 @@ grading, or coordinate mode.
 ## Installation
 
 Clone or copy this folder into the FreeCAD user `Mod` directory:
-
-```bash
-~/.local/share/FreeCAD/v1-1/Mod/gyroid_assembler
 ```
+# Linux / macOS
+cd ~/home/username/.local/share/FreeCAD/Mod/
+# or ~/.FreeCAD/Mod for older versions
+git clone https://github.com/kevinsmia1939/FreeCAD-TPMS
 
+# Windows
+cd %APPDATA%\FreeCAD\Mod
+git clone https://github.com/kevinsmia1939/FreeCAD-TPMS
+```
 Restart FreeCAD and select the `TPMS Generator` workbench.
 
 ## Basic Workflow

@@ -349,6 +349,14 @@ class TPMSUnitCell:
         if not hasattr(obj, "Surface"):
             obj.addProperty("App::PropertyEnumeration", "Surface", "TPMS", "Preset TPMS equation")
             obj.Surface = tpms_generator.surface_names() + ["Custom"]
+        else:
+            try:
+                current_surface = str(obj.Surface)
+                surface_options = tpms_generator.surface_names() + ["Custom"]
+                obj.Surface = surface_options
+                obj.Surface = current_surface if current_surface in surface_options else "Custom"
+            except Exception:
+                pass
         if not hasattr(obj, "Equation"):
             obj.addProperty("App::PropertyString", "Equation", "TPMS", "Implicit equation using x, y, z")
         if not hasattr(obj, "Part"):
@@ -554,11 +562,19 @@ class TPMSUnitCell:
         self._add_properties(obj)
 
     def onChanged(self, obj, prop):
-        if prop == "Surface" and getattr(obj, "Surface", "") != "Custom":
+        if prop == "Surface" and str(getattr(obj, "Surface", "")) in tpms_generator.SURFACE_EQUATIONS:
             try:
                 import tpms_generator
 
                 obj.Equation = tpms_generator.SURFACE_EQUATIONS[str(obj.Surface)]
+            except Exception:
+                pass
+        if prop == "Surface" and str(getattr(obj, "Surface", "")) in (
+            tpms_generator.SURFACE_EMPTY,
+            tpms_generator.SURFACE_SOLID_FILL,
+        ):
+            try:
+                obj.Equation = ""
             except Exception:
                 pass
         if prop in ("RegionRole", "RegionMode"):
@@ -885,6 +901,8 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
     phase = _vector_tuple(getattr(base, "Phase", App.Vector(0.0, 0.0, 0.0)), fallback=(0.0, 0.0, 0.0), minimum=None)
     region_specs = _hybrid_region_specs(base, items)
     transition_region_specs = _hybrid_transition_region_specs(base, items)
+    unit_cell_controls = _hybrid_unit_cell_controls(base, items)
+    density_offset_controls = _hybrid_density_offset_controls(base, items)
     return tpms_generator.generate_hybrid_freecad_mesh(
         str(getattr(base, "Equation", "")),
         str(getattr(base, "Part", tpms_generator.PART_SHEET)),
@@ -907,6 +925,14 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         region_specs,
         [],
         transition_region_specs,
+        "Non-uniform" if unit_cell_controls else "Uniform",
+        unit_cell_controls,
+        str(getattr(base, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+        "Non-uniform" if density_offset_controls else "Uniform",
+        density_offset_controls,
+        str(getattr(base, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+        max(0, int(getattr(base, "GradingResolution", 16))),
+        str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
     )
 
 
@@ -982,6 +1008,63 @@ def _hybrid_transition_region_specs(base, items):
             }
         )
     return specs
+
+
+def _hybrid_unit_cell_controls(base, items):
+    controls = []
+    seen = set()
+    for setting in _hybrid_generation_settings(base, items):
+        for control in _unit_cell_controls(setting):
+            key = _grading_control_key(control)
+            if key in seen:
+                continue
+            seen.add(key)
+            controls.append(control)
+    return controls
+
+
+def _hybrid_density_offset_controls(base, items):
+    controls = []
+    seen = set()
+    for setting in _hybrid_generation_settings(base, items):
+        for control in _density_offset_controls(setting):
+            key = _grading_control_key(control)
+            if key in seen:
+                continue
+            seen.add(key)
+            controls.append(control)
+    return controls
+
+
+def _hybrid_generation_settings(base, items):
+    settings = [base]
+    for item in items:
+        setting = _region_generation_setting(base, int(item["index"]))
+        if setting is base:
+            continue
+        if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION:
+            continue
+        settings.append(setting)
+    return settings
+
+
+def _grading_control_key(control):
+    point = tuple(round(float(value), 9) for value in control.get("point", ()))
+    normal = tuple(round(float(value), 9) for value in control.get("normal", ()))
+    transition = round(float(control.get("transition", 0.0)), 9)
+    value = round(float(control.get("density", control.get("offset", 0.0))), 9)
+    surface = control.get("surface") or {}
+    affected = tuple(int(value) for value in control.get("affected_regions", []) or [])
+    return (
+        str(control.get("type", "")),
+        point,
+        normal,
+        transition,
+        value,
+        affected,
+        len(surface.get("points", []) or []),
+        len(surface.get("triangles", []) or []),
+    )
 
 
 def _region_endpoint_setting(base, region_index):
@@ -1190,6 +1273,9 @@ class TPMSGradingControl:
             obj.addProperty("App::PropertyXLink", "SourceObject", "Grading", "Solid object containing the selected face")
         if not hasattr(obj, "FaceNames"):
             obj.addProperty("App::PropertyStringList", "FaceNames", "Grading", "Selected subelement face names")
+        if not hasattr(obj, "AffectedRegions"):
+            obj.addProperty("App::PropertyString", "AffectedRegions", "Grading", "One-based region numbers affected by this control, empty for all regions")
+            obj.AffectedRegions = ""
         if not hasattr(obj, "UseUnitCellDensity"):
             obj.addProperty("App::PropertyBool", "UseUnitCellDensity", "Unit cell density", "Use this control for unit-cell density")
             obj.UseUnitCellDensity = True
@@ -1217,6 +1303,7 @@ class TPMSGradingControl:
             "Enabled",
             "SourceObject",
             "FaceNames",
+            "AffectedRegions",
             "UseUnitCellDensity",
             "DensityFactor",
             "UnitCellTransition",
@@ -1292,6 +1379,7 @@ def add_grading_control(
 
     control.SourceObject = source_object
     control.FaceNames = list(face_names)
+    control.AffectedRegions = _default_grading_regions(controller)
     control.UseUnitCellDensity = bool(use_unit_cell_density)
     control.DensityFactor = float(unit_cell_density if unit_cell_density is not None else getattr(controller, "FaceDensity", 1.5))
     control.UnitCellTransition = float(unit_cell_transition if unit_cell_transition is not None else getattr(controller, "DensityTransition", 5.0))
@@ -1412,6 +1500,7 @@ def _unit_cell_controls(obj):
                     "density": max(0.05, float(getattr(control, "DensityFactor", 1.0))),
                     "transition": max(1e-9, float(getattr(control, "UnitCellTransition", getattr(control, "Transition", 1.0)))),
                     "surface": surface,
+                    "affected_regions": _affected_region_indices(control),
                 }
             )
     return controls
@@ -1455,9 +1544,36 @@ def _density_offset_controls(obj):
                     "offset": float(getattr(control, "OffsetValue", getattr(obj, "Offset", 0.3))),
                     "transition": max(1e-9, float(getattr(control, "ThicknessTransition", getattr(control, "Transition", 1.0)))),
                     "surface": surface,
+                    "affected_regions": _affected_region_indices(control),
                 }
             )
     return controls
+
+
+def _default_grading_regions(controller):
+    if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE:
+        return str(int(getattr(controller, "RegionIndex", 0)) + 1)
+    if str(getattr(controller, "RegionRole", REGION_ROLE_BASE)) in (REGION_ROLE_OVERRIDE, REGION_ROLE_TRANSITION):
+        return str(int(getattr(controller, "RegionIndex", 0)) + 1)
+    return ""
+
+
+def _affected_region_indices(control):
+    text = str(getattr(control, "AffectedRegions", "")).strip()
+    if not text:
+        return []
+    indices = []
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except Exception:
+            continue
+        if value > 0:
+            indices.append(value - 1)
+    return sorted(set(indices))
 
 
 def _shape_tolerance(shape):

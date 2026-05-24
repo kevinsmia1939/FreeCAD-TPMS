@@ -25,6 +25,9 @@ class TPMSGradingTaskPanel:
         self.faces.setWordWrap(True)
         form.addRow("Faces", self.faces)
 
+        self.affected_regions = QtWidgets.QLineEdit(str(getattr(obj, "AffectedRegions", "")))
+        form.addRow("Affected regions", self.affected_regions)
+
         self.use_unit_cell_density = QtWidgets.QCheckBox()
         self.use_unit_cell_density.setChecked(bool(getattr(obj, "UseUnitCellDensity", True)))
         form.addRow("Unit-cell density", self.use_unit_cell_density)
@@ -86,6 +89,10 @@ class TPMSGradingTaskPanel:
         self._set_tip(self.source, "The solid whose face selection created this grading control.")
         self._set_tip(self.faces, "The selected face names used as the grading source region.")
         self._set_tip(
+            self.affected_regions,
+            "One-based region numbers affected by this control, for example 1,3. Leave empty to affect all regions.",
+        )
+        self._set_tip(
             self.use_unit_cell_density,
             "Applies this face control to unit-cell density grading. Disable it to keep only thickness grading.",
         )
@@ -124,6 +131,7 @@ class TPMSGradingTaskPanel:
         doc.openTransaction("Edit TPMS grading")
         try:
             obj.Enabled = bool(self.enabled.isChecked())
+            obj.AffectedRegions = self.affected_regions.text().strip()
             obj.UseUnitCellDensity = bool(self.use_unit_cell_density.isChecked())
             obj.DensityFactor = float(self.density_factor.value())
             obj.UnitCellTransition = float(self.unit_cell_transition.value())
