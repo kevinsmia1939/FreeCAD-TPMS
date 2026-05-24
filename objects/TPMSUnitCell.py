@@ -134,13 +134,9 @@ def _make_region_controller(doc, container):
         TPMSUnitCellViewProvider(controller.ViewObject)
         _configure_controller_view(controller.ViewObject)
 
-    mesh_obj = doc.addObject("Mesh::Feature", "TPMS_Region_Mesh")
-    mesh_obj.Label = "TPMS Region Mesh"
     if container is not None:
         container.addObject(controller)
-        container.addObject(mesh_obj)
-    controller.ResultMesh = mesh_obj
-    return controller, mesh_obj
+    return controller, None
 
 
 def _configure_region_controller(source_controller, controller, region_index):
@@ -151,9 +147,6 @@ def _configure_region_controller(source_controller, controller, region_index):
     controller.TransitionMode = TRANSITION_MODE_NONE
     controller.RegionDescription = _region_label_for_index(getattr(source_controller, "BoundaryObject", None), region_index)
     controller.Label = "TPMS Region {}".format(int(region_index) + 1)
-    mesh_obj = getattr(controller, "ResultMesh", None)
-    if mesh_obj is not None:
-        mesh_obj.Label = "TPMS Mesh Region {}".format(int(region_index) + 1)
 
 
 def _copy_tpms_settings(source, target):
@@ -532,6 +525,8 @@ class TPMSUnitCell:
             obj.RelaxCapSurface = False
         if not hasattr(obj, "ResultMesh"):
             obj.addProperty("App::PropertyLink", "ResultMesh", "TPMS", "Generated mesh object")
+        if not hasattr(obj, "ResultRegionMeshes"):
+            obj.addProperty("App::PropertyLinkList", "ResultRegionMeshes", "TPMS", "Generated per-region mesh objects")
         if not hasattr(obj, "FacetCount"):
             obj.addProperty("App::PropertyInteger", "FacetCount", "Result", "Generated triangle count")
             obj.setEditorMode("FacetCount", 1)
@@ -566,6 +561,14 @@ class TPMSUnitCell:
             _sync_resolution_editor_mode(obj)
         if prop == "Resolution" and str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_BASE:
             _sync_region_resolutions_from_base(obj)
+        if prop == "Resolution" and str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_BASE:
+            base = _base_controller_for(obj)
+            resolution = max(4, int(getattr(base, "Resolution", getattr(obj, "Resolution", 16))))
+            if int(getattr(obj, "Resolution", resolution)) != resolution:
+                try:
+                    obj.Resolution = resolution
+                except Exception:
+                    pass
 
     def execute(self, obj):
         import tpms_generator
@@ -577,6 +580,13 @@ class TPMSUnitCell:
             obj.ResultMesh = mesh_obj
 
         try:
+            if _is_region_setting(obj):
+                _clear_region_setting_mesh(obj)
+                return
+            if _uses_per_region_meshes(obj):
+                _execute_per_region_meshes(obj, mesh_obj, tpms_generator)
+                return
+
             resolution = _effective_resolution(obj)
             repeat_cell = (1, 1, 1)
             cell_size = _vector_tuple(obj.CellSize, fallback=(10.0, 10.0, 10.0), minimum=1e-9)
@@ -788,6 +798,234 @@ def selected_boundary_region(controller):
     index = max(0, min(int(getattr(controller, "RegionIndex", 0)), len(items) - 1))
     item = items[index]
     return _ShapeBoundaryAdapter(item["solid"], item["label"]), item["label"], len(items)
+
+
+def _is_region_setting(obj):
+    return (
+        str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_BASE
+        or str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE
+    )
+
+
+def _uses_per_region_meshes(obj):
+    import tpms_generator
+
+    if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_BASE:
+        return False
+    if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_ALL:
+        return False
+    if str(getattr(obj, "BoundaryMode", "")) != tpms_generator.BOUNDARY_SELECTED_SOLID:
+        return False
+    return len(boundary_region_items(getattr(obj, "BoundaryObject", None))) > 1
+
+
+def _clear_region_setting_mesh(obj):
+    mesh_obj = getattr(obj, "ResultMesh", None)
+    if mesh_obj is not None:
+        mesh_obj.Mesh = Mesh.Mesh()
+        try:
+            mesh_obj.Label = "{} Mesh (settings only)".format(obj.Label)
+        except Exception:
+            pass
+    obj.FacetCount = 0
+    obj.IsSolidMesh = False
+    obj.HasNonManifolds = False
+    obj.LastError = ""
+
+
+def _execute_per_region_meshes(base, primary_mesh_obj, tpms_generator):
+    _sync_region_resolutions_from_base(base)
+    items = boundary_region_items(getattr(base, "BoundaryObject", None))
+    meshes = _ensure_region_result_meshes(base, primary_mesh_obj, len(items))
+    total_facets = 0
+    any_non_manifold = False
+    all_solid = True
+    errors = []
+
+    for item in items:
+        index = int(item["index"])
+        setting = _region_generation_setting(base, index)
+        mesh_obj = meshes[index]
+        try:
+            mesh = _generate_region_mesh(base, setting, item, items, tpms_generator)
+        except Exception as exc:
+            mesh = Mesh.Mesh()
+            errors.append("Region {}: {}".format(index + 1, exc))
+        mesh_obj.Mesh = mesh
+        mesh_obj.Label = "TPMS Mesh Region {}".format(index + 1)
+        total_facets += int(mesh.CountFacets)
+        if int(mesh.CountFacets) > 0:
+            all_solid = all_solid and bool(mesh.isSolid())
+            any_non_manifold = any_non_manifold or bool(mesh.hasNonManifolds())
+
+    base.ResultRegionMeshes = meshes
+    base.RegionCount = len(items)
+    base.RegionDescription = "Generated {} solid region mesh(es)".format(len(items))
+    base.FacetCount = int(total_facets)
+    base.IsSolidMesh = bool(total_facets > 0 and all_solid)
+    base.HasNonManifolds = bool(any_non_manifold)
+    base.LastError = "; ".join(errors)
+    if errors:
+        App.Console.PrintError("TPMS region generation failed: {}\n".format(base.LastError))
+
+
+def _ensure_region_result_meshes(base, primary_mesh_obj, count):
+    doc = base.Document
+    container = _container_for(base)
+    meshes = list(getattr(base, "ResultRegionMeshes", []))
+    ordered = []
+    if primary_mesh_obj is not None:
+        ordered.append(primary_mesh_obj)
+    for mesh in meshes:
+        if mesh is not None and mesh not in ordered:
+            ordered.append(mesh)
+    while len(ordered) < int(count):
+        mesh = doc.addObject("Mesh::Feature", "TPMS_Mesh_Region_{}".format(len(ordered) + 1))
+        mesh.Label = "TPMS Mesh Region {}".format(len(ordered) + 1)
+        if container is not None:
+            container.addObject(mesh)
+        ordered.append(mesh)
+    return ordered[: int(count)]
+
+
+def _region_generation_setting(base, region_index):
+    transition = _region_controller_for(base, region_index, roles=(REGION_ROLE_TRANSITION,))
+    if transition is not None:
+        return transition
+    override = _region_controller_for(base, region_index, roles=(REGION_ROLE_OVERRIDE,))
+    if override is not None:
+        return override
+    return base
+
+
+def _generate_region_mesh(base, setting, item, items, tpms_generator):
+    resolution = max(4, int(getattr(base, "Resolution", 16)))
+    cell_size = _vector_tuple(getattr(setting, "CellSize", getattr(base, "CellSize", App.Vector(10.0, 10.0, 10.0))), fallback=(10.0, 10.0, 10.0), minimum=1e-9)
+    phase = _vector_tuple(getattr(setting, "Phase", getattr(base, "Phase", App.Vector(0.0, 0.0, 0.0))), fallback=(0.0, 0.0, 0.0), minimum=None)
+    boundary = _ShapeBoundaryAdapter(item["solid"], item["label"])
+    unit_cell_controls = _unit_cell_controls(setting)
+    offset_controls = _density_offset_controls(setting)
+    transition_unit, transition_offset, transition_equation, transition_gradient = _region_transition_controls(base, setting, item, items)
+    if transition_unit:
+        unit_cell_controls = list(unit_cell_controls) + transition_unit
+    if transition_offset:
+        offset_controls = list(offset_controls) + transition_offset
+
+    source = _transition_endpoint_controller(setting, "source") if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION else setting
+    if source is None:
+        source = setting
+    equation = str(getattr(source, "Equation", getattr(setting, "Equation", getattr(base, "Equation", ""))))
+    base_density = max(0.05, float(getattr(source, "BaseDensity", getattr(setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))))
+    offset = float(getattr(source, "Offset", getattr(setting, "Offset", getattr(base, "Offset", 0.3))))
+
+    return tpms_generator.generate_freecad_mesh(
+        equation,
+        str(getattr(source, "Part", getattr(setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET)))),
+        cell_size,
+        (1, 1, 1),
+        resolution,
+        offset,
+        phase,
+        bool(getattr(base, "MeshStitching", False)),
+        tpms_generator.BOUNDARY_SELECTED_SOLID,
+        boundary,
+        max(0.0, float(getattr(base, "Sampling", 0.0))),
+        bool(getattr(base, "AddCaps", True)),
+        bool(getattr(base, "MeshRelaxation", False)),
+        max(0, int(getattr(base, "RelaxIterations", 5))),
+        bool(getattr(base, "RelaxSkipBoundary", True)),
+        bool(getattr(base, "RelaxCapSurface", False)),
+        _origin_tuple(base),
+        _origin_rotation(base),
+        "Non-uniform" if transition_unit else str(getattr(setting, "DensityMode", getattr(base, "DensityMode", "Uniform"))),
+        base_density,
+        unit_cell_controls,
+        str(getattr(setting, "DensityCountMode", getattr(base, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW))),
+        transition_gradient if transition_unit else str(getattr(setting, "DensityGradient", getattr(base, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE))),
+        "Non-uniform" if transition_offset else str(getattr(setting, "DensityOffsetMode", getattr(base, "DensityOffsetMode", "Uniform"))),
+        offset,
+        offset_controls,
+        transition_gradient if transition_offset else str(getattr(setting, "DensityOffsetGradient", getattr(base, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE))),
+        transition_equation,
+        str(getattr(base, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
+        max(1e-9, float(getattr(base, "RingRadius", 25.0))),
+        max(1e-9, float(getattr(base, "RingOuterRadius", float(getattr(base, "RingRadius", 25.0)) + float(getattr(base, "RingRadialThickness", 10.0))))),
+        max(1e-9, float(getattr(base, "RingHeight", 10.0))),
+        max(1, int(getattr(base, "RingAngularCells", 8))),
+        max(0, int(getattr(base, "GradingResolution", 16))),
+        str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
+    )
+
+
+def _region_transition_controls(base, setting, item, items):
+    import tpms_generator
+
+    if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION:
+        return _transition_controls(setting)
+
+    index = int(item["index"])
+    solid = item["solid"]
+    width = _shared_transition_width(base, index, None)
+    density_controls = []
+    offset_controls = []
+    equation_controls = []
+    gradient = tpms_generator.GRADIENT_FACE_DISTANCE
+    for other in items:
+        other_index = int(other["index"])
+        if other_index == index:
+            continue
+        other_setting = _region_generation_setting(base, other_index)
+        if other_setting is setting:
+            continue
+        pair_width = _shared_transition_width(base, index, other_index)
+        if pair_width <= 0.0 and _same_tpms_region_settings(setting, other_setting):
+            continue
+        density, offset, equation = _transition_controls_for_touching_faces(
+            solid,
+            other["solid"],
+            other_setting,
+            pair_width if pair_width > 0.0 else width,
+        )
+        density_controls.extend(density)
+        offset_controls.extend(offset)
+        equation_controls.extend(equation)
+    return density_controls, offset_controls, equation_controls, gradient
+
+
+def _same_tpms_region_settings(left, right):
+    return (
+        str(getattr(left, "Equation", "")) == str(getattr(right, "Equation", ""))
+        and abs(float(getattr(left, "BaseDensity", 1.0)) - float(getattr(right, "BaseDensity", 1.0))) <= 1e-9
+        and abs(float(getattr(left, "Offset", 0.3)) - float(getattr(right, "Offset", 0.3))) <= 1e-9
+    )
+
+
+def _shared_transition_width(base, region_a, region_b):
+    width = 0.0
+    container = _container_for(base)
+    boundary = getattr(base, "BoundaryObject", None)
+    for obj in getattr(base.Document, "Objects", []):
+        if not is_tpms_unit_cell(obj):
+            continue
+        if container is not None and _container_for(obj) != container:
+            continue
+        if getattr(obj, "BoundaryObject", None) != boundary:
+            continue
+        if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
+            continue
+        if str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE)) != TRANSITION_MODE_SHARED_FACE:
+            continue
+        source = int(getattr(obj, "TransitionSourceRegion", -1))
+        target = int(getattr(obj, "TransitionTargetRegion", -1))
+        pair_matches = region_b is None or {int(region_a), int(region_b)} == {source, target}
+        if pair_matches and int(region_a) in (source, target, int(getattr(obj, "RegionIndex", -2))):
+            width = max(width, float(getattr(obj, "TransitionWidth", 0.0)))
+    if width > 0.0:
+        return width
+    try:
+        return max(1e-9, 0.5 * min(_vector_tuple(getattr(base, "CellSize", App.Vector(10.0, 10.0, 10.0)), (10.0, 10.0, 10.0), 1e-9)))
+    except Exception:
+        return 5.0
 
 
 class TPMSFaceDensityControl:

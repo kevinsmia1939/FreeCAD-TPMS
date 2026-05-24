@@ -157,14 +157,10 @@ def run_file(path):
 
             facets = _mesh_facet_count(obj)
             role = _role(obj)
-            description = str(getattr(obj, "RegionDescription", ""))
-            base_can_be_empty = (
-                obj is controller
-                and role == REGION_ROLE_BASE
-                and description.startswith("Base has no unassigned regions")
-            )
-            if facets <= 0 and not base_can_be_empty:
-                raise RuntimeError("{} generated an empty mesh".format(obj.Label))
+            if obj is controller and facets <= 0:
+                raise RuntimeError("{} generated an empty primary region mesh".format(obj.Label))
+            if obj is not controller and facets != 0:
+                raise RuntimeError("{} generated an independent mesh; region settings should be settings-only".format(obj.Label))
             if _role(obj) != REGION_ROLE_BASE and int(getattr(obj, "Resolution", 0)) != int(controller.Resolution):
                 raise RuntimeError(
                     "{} kept an independent resolution {} instead of base {}".format(
@@ -189,20 +185,24 @@ def run_file(path):
             )
 
         base_description = str(getattr(controller, "RegionDescription", ""))
-        if len(covered_regions) >= len(regions) and not base_description.startswith("Base has no unassigned regions"):
+        if not base_description.startswith("Generated {} solid region mesh".format(len(regions))):
             raise RuntimeError(
-                "{} base controller did not skip covered regions: {}".format(path, base_description)
+                "{} base controller did not generate per-region meshes: {}".format(path, base_description)
             )
 
-        override_facets = sum(_mesh_facet_count(obj) for obj in single_region)
+        region_meshes = list(getattr(controller, "ResultRegionMeshes", []))
+        if len(region_meshes) != len(regions):
+            raise RuntimeError("{} has {} result meshes for {} regions".format(path, len(region_meshes), len(regions)))
+        region_facets = [int(mesh.Mesh.CountFacets) for mesh in region_meshes]
+        if any(facets <= 0 for facets in region_facets):
+            raise RuntimeError("{} generated empty per-region mesh facets {}".format(path, region_facets))
         print(
-            "PASS {} regions={} created={} transition_controls={} main_facets={} override_facets={} main_region='{}' main_bounds={}".format(
+            "PASS {} regions={} created={} transition_controls={} region_facets={} main_region='{}' main_bounds={}".format(
                 os.path.basename(path),
                 len(regions),
                 len(created),
                 transition_control_count,
-                _mesh_facet_count(controller),
-                override_facets,
+                region_facets,
                 base_description,
                 tuple(round(value, 6) for value in _mesh_bounds(controller.ResultMesh)) if _mesh_facet_count(controller) else (),
             )
