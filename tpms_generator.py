@@ -1119,16 +1119,13 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
     if hasattr(boundary_object, "Shape"):
         sphere_shell = _spherical_shell_from_shape(boundary_object.Shape)
         if sphere_shell is not None:
-            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
-            return _spherical_shell_field(lx, ly, lz, *sphere_shell)
+            return _spherical_shell_field(wx, wy, wz, *sphere_shell)
         conical_shell = _conical_inner_cylindrical_shell_from_shape(boundary_object.Shape)
         if conical_shell is not None:
-            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
-            return _conical_inner_cylindrical_shell_field(lx, ly, lz, *conical_shell)
+            return _conical_inner_cylindrical_shell_field(wx, wy, wz, *conical_shell)
         shell = _cylindrical_shell_from_shape(boundary_object.Shape)
         if shell is not None:
-            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
-            return _cylindrical_shell_field(lx, ly, lz, *shell)
+            return _cylindrical_shell_field(wx, wy, wz, *shell)
 
     return None
 
@@ -1838,7 +1835,9 @@ def generate_cylindrical_ring_polydata(
     configure_vtk_smp()
     cell_size = np.asarray(cell_size, dtype=float)
     phase = np.asarray(phase, dtype=float)
-    origin = np.asarray(origin if origin is not None else (0.0, 0.0, 0.0), dtype=float)
+    if origin is None:
+        origin = _default_origin(boundary_mode, boundary_object)
+    origin = np.asarray(origin, dtype=float)
 
     inner_radius = max(float(ring_radius), 1e-9)
     outer_radius = max(float(ring_outer_radius), inner_radius + 1e-9)

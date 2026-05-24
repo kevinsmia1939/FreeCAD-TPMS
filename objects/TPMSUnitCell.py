@@ -704,11 +704,11 @@ def is_tpms_unit_cell(obj):
 class _ShapeBoundaryAdapter:
     TypeId = "TPMS::BoundaryRegion"
 
-    def __init__(self, shape, label, region_solids=None):
+    def __init__(self, shape, label, region_solids=None, placement=None):
         self.Shape = shape
         self.Label = label
         self.Name = label
-        self.Placement = App.Placement()
+        self.Placement = placement if placement is not None else App.Placement()
         self.ForceTessellatedBoundary = True
         if region_solids is not None:
             self.BoundaryRegionSolids = list(region_solids)
@@ -762,6 +762,7 @@ def boundary_region_items(boundary_object):
 def selected_boundary_region(controller):
     boundary = getattr(controller, "BoundaryObject", None)
     items = boundary_region_items(boundary)
+    placement = getattr(boundary, "Placement", None)
     if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE or len(items) <= 1:
         if len(items) > 1:
             active_items = items
@@ -782,17 +783,18 @@ def selected_boundary_region(controller):
                     boundary.Shape,
                     description,
                     [item["solid"] for item in active_items],
+                    placement,
                 ),
                 description,
                 len(items),
             )
         if len(items) == 1:
-            return _ShapeBoundaryAdapter(items[0]["solid"], "Region 1"), "Region 1", 1
+            return _ShapeBoundaryAdapter(items[0]["solid"], "Region 1", placement=placement), "Region 1", 1
         return boundary, "No solid regions detected", 0
 
     index = max(0, min(int(getattr(controller, "RegionIndex", 0)), len(items) - 1))
     item = items[index]
-    return _ShapeBoundaryAdapter(item["solid"], item["label"]), item["label"], len(items)
+    return _ShapeBoundaryAdapter(item["solid"], item["label"], placement=placement), item["label"], len(items)
 
 
 def _is_region_setting(obj):

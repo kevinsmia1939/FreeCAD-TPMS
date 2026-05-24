@@ -24,6 +24,7 @@ from objects.TPMSUnitCell import (
     boundary_region_items,
     is_tpms_unit_cell,
     make_tpms_unit_cell,
+    selected_boundary_region,
 )
 
 
@@ -246,8 +247,10 @@ def _assert_transition_weight_varies(source_solid, transition_solid, target_soli
 
 
 class _BoundaryProbe:
-    def __init__(self, shape):
+    def __init__(self, shape, placement=None):
         self.Shape = shape
+        if placement is not None:
+            self.Placement = placement
 
 
 def run_generated_transition_region_case():
@@ -314,10 +317,102 @@ def run_generated_transition_region_case():
         App.closeDocument(doc.Name)
 
 
+def run_cylindrical_ring_boundary_origin_case():
+    import Part
+
+    placement = App.Placement(App.Vector(42.0, -17.0, 6.0), App.Rotation())
+    boundary = _BoundaryProbe(Part.makeBox(80.0, 80.0, 40.0, App.Vector(2.0, -57.0, -4.0)), placement)
+    polydata = tpms_generator.generate_cylindrical_ring_polydata(
+        tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        tpms_generator.PART_SURFACE,
+        (10.0, 10.0, 10.0),
+        8,
+        0.3,
+        (0.0, 0.0, 0.0),
+        False,
+        None,
+        None,
+        6.0,
+        9.0,
+        10.0,
+        6,
+        boundary_mode=tpms_generator.BOUNDARY_SELECTED_SOLID,
+        boundary_object=boundary,
+    )
+    if polydata.n_points <= 0:
+        raise RuntimeError("Cylindrical ring boundary-origin case generated an empty surface")
+    center = polydata.center
+    expected = (placement.Base.x, placement.Base.y)
+    error = ((float(center[0]) - expected[0]) ** 2 + (float(center[1]) - expected[1]) ** 2) ** 0.5
+    if error > 2.0:
+        raise RuntimeError(
+            "Cylindrical ring ignored boundary origin: center=({:.3f}, {:.3f}), expected near=({:.3f}, {:.3f})".format(
+                float(center[0]),
+                float(center[1]),
+                expected[0],
+                expected[1],
+            )
+        )
+    print(
+        "PASS cylindrical_ring_boundary_origin center=({:.3f}, {:.3f}, {:.3f}) expected_xy=({:.3f}, {:.3f})".format(
+            float(center[0]),
+            float(center[1]),
+            float(center[2]),
+            expected[0],
+            expected[1],
+        )
+    )
+
+    moved_tube_placement = App.Placement(App.Vector(10.5, 0.0, 0.0), App.Rotation())
+    outer = Part.makeCylinder(5.0, 10.0, moved_tube_placement.Base)
+    inner = Part.makeCylinder(2.0, 10.0, moved_tube_placement.Base)
+    tube_boundary = _BoundaryProbe(outer.cut(inner), moved_tube_placement)
+    controller = type("ControllerProbe", (), {})()
+    controller.BoundaryObject = tube_boundary
+    controller.RegionMode = REGION_MODE_ALL
+    controller.RegionRole = REGION_ROLE_BASE
+    controller.BaseExcludesRegionSettings = False
+    region_boundary, _description, _count = selected_boundary_region(controller)
+    polydata = tpms_generator.generate_cylindrical_ring_polydata(
+        tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        tpms_generator.PART_SHEET,
+        (10.0, 10.0, 10.0),
+        8,
+        0.3,
+        (0.0, 0.0, 0.0),
+        True,
+        None,
+        None,
+        2.0,
+        5.0,
+        10.0,
+        8,
+        boundary_mode=tpms_generator.BOUNDARY_SELECTED_SOLID,
+        boundary_object=region_boundary,
+    )
+    if polydata.n_points <= 0:
+        raise RuntimeError("Cylindrical ring region-adapter origin case generated an empty surface")
+    bounds = polydata.bounds
+    if abs(float(bounds[0]) - 5.5) > 0.2 or abs(float(bounds[1]) - 15.5) > 0.2:
+        raise RuntimeError(
+            "Cylindrical ring region adapter lost boundary placement: bounds=({:.3f}, {:.3f})".format(
+                float(bounds[0]),
+                float(bounds[1]),
+            )
+        )
+    print(
+        "PASS cylindrical_ring_region_adapter_origin x_bounds=({:.3f}, {:.3f})".format(
+            float(bounds[0]),
+            float(bounds[1]),
+        )
+    )
+
+
 def main():
     for name in TEST_FILES:
         run_file(os.path.join(STUDY_DIR, name))
     run_generated_transition_region_case()
+    run_cylindrical_ring_boundary_origin_case()
 
 
 if not getattr(App, "_tpms_boolean_fragment_region_workflow_ran", False):
