@@ -372,8 +372,8 @@ class TPMSTaskPanel:
         self._set_tip(self.base_excludes, "When enabled, the base all-region mesh skips regions covered by override or transition settings.")
         self._set_tip(self.transition_mode, "None disables transition behavior. Shared face and Bridge region store transition intent for region-aware blending.")
         self._set_tip(self.transition_width, "Width of a shared-face transition band in document units.")
-        self._set_tip(self.transition_source, "Source region index for a bridge transition.")
-        self._set_tip(self.transition_target, "Target region index for a bridge transition.")
+        self._set_tip(self.transition_source, "Source region index for shared-face or bridge transition.")
+        self._set_tip(self.transition_target, "Target region index for shared-face or bridge transition.")
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
         self._set_tip(self.density_mode, "Enable non-uniform unit-cell density grading from selected faces.")
@@ -632,10 +632,9 @@ class TPMSTaskPanel:
 
     def _update_transition_controls(self):
         enabled = self.region_role.currentText() == "Transition" and self.transition_mode.currentText() != "None"
-        bridge_enabled = enabled and self.transition_mode.currentText() == "Bridge region"
         self.transition_width.setEnabled(enabled)
-        self.transition_source.setEnabled(bridge_enabled)
-        self.transition_target.setEnabled(bridge_enabled)
+        self.transition_source.setEnabled(enabled)
+        self.transition_target.setEnabled(enabled)
 
     def _update_coordinate_controls(self):
         ring_mode = self.coordinate_mode.currentText() == self.generator.COORDINATE_CYLINDRICAL_RING
