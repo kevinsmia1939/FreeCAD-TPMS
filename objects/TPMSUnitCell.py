@@ -494,6 +494,7 @@ class _ShapeBoundaryAdapter:
         self.Label = label
         self.Name = label
         self.Placement = App.Placement()
+        self.ForceTessellatedBoundary = True
 
 
 def boundary_region_solids(boundary_object):
@@ -546,9 +547,9 @@ def selected_boundary_region(controller):
     items = boundary_region_items(boundary)
     if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE or len(items) <= 1:
         if len(items) > 1:
-            return boundary, "All {} regions".format(len(items)), len(items)
+            return _ShapeBoundaryAdapter(boundary.Shape, "All {} regions".format(len(items))), "All {} regions".format(len(items)), len(items)
         if len(items) == 1:
-            return boundary, "Region 1", 1
+            return _ShapeBoundaryAdapter(items[0]["solid"], "Region 1"), "Region 1", 1
         return boundary, "No solid regions detected", 0
 
     index = max(0, min(int(getattr(controller, "RegionIndex", 0)), len(items) - 1))

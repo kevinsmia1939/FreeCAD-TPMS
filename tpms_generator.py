@@ -974,6 +974,8 @@ def _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling=0.0):
 
 
 def _analytic_boundary_field(boundary_object, wx, wy, wz):
+    if bool(getattr(boundary_object, "ForceTessellatedBoundary", False)):
+        return None
     type_id = getattr(boundary_object, "TypeId", "")
     placement = getattr(boundary_object, "Placement", None)
     if placement is None:
