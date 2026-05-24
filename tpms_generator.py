@@ -542,6 +542,11 @@ def _smooth_falloff_weight(distance, transition):
     return 1.0 - smooth
 
 
+def _smoothstep(t):
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
 def _blend_equation_field(base_field, x, y, z, wx, wy, wz, equation_blend_controls=None):
     field = np.asarray(base_field, dtype=float)
     for control in equation_blend_controls or []:
@@ -878,6 +883,35 @@ def _implicit_distances(surface, points):
     cloud = pv.PolyData(points)
     sampled = cloud.compute_implicit_distance(surface, inplace=False)
     return np.asarray(sampled["implicit_distance"], dtype=float)
+
+
+def _selected_boundary_distance_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    solids = getattr(boundary_object, "BoundaryRegionSolids", None)
+    if solids:
+        field = None
+        for solid in solids:
+            solid_adapter = _BoundaryShapeAdapter(solid)
+            solid_field = _selected_boundary_distance_vtk(
+                solid_adapter,
+                wx,
+                wy,
+                wz,
+                sampling,
+                fallback_resolution,
+            )
+            field = solid_field if field is None else np.minimum(field, solid_field)
+        if field is not None:
+            return field
+
+    cache_key = _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, "distance")
+    if cache_key is not None and cache_key in _BOUNDARY_FIELD_CACHE:
+        return _BOUNDARY_FIELD_CACHE[cache_key].copy()
+
+    surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
+    distance = np.abs(_implicit_distances(surface, points)).reshape(wx.shape, order="C")
+    _store_boundary_field_cache(cache_key, distance)
+    return distance
 
 
 def _boundary_shell_mask(inside):
@@ -1615,10 +1649,12 @@ def generate_hybrid_polydata(
     base_density=1.0,
     region_specs=None,
     transition_controls=None,
+    transition_region_specs=None,
 ):
     configure_vtk_smp()
     region_specs = list(region_specs or [])
     transition_controls = list(transition_controls or [])
+    transition_region_specs = list(transition_region_specs or [])
     grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
         cell_size,
         repeat_cell,
@@ -1650,27 +1686,67 @@ def generate_hybrid_polydata(
     base_density = max(0.05, float(base_density))
 
     fallback_resolution = max(wx.shape)
+    def boundary_mask(boundary):
+        try:
+            return _selected_boundary_field_signed_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) >= 0.0
+        except Exception:
+            return _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
+
+    def boundary_distance(boundary):
+        try:
+            return _selected_boundary_distance_vtk(boundary, wx, wy, wz, sampling, fallback_resolution)
+        except Exception:
+            mask = _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
+            return np.where(mask, 0.0, np.inf)
+
+    def evaluated_field(spec, equation_key="equation", density_key="base_density"):
+        density = max(0.05, float(spec.get(density_key, base_density)))
+        scale = density / base_density
+        values = np.asarray(evaluate_equation(str(spec.get(equation_key, equation)), x * scale, y * scale, z * scale), dtype=float)
+        if values.shape == ():
+            values = np.full(field.shape, float(values))
+        return values
+
     for spec in region_specs:
         boundary = spec.get("boundary_object")
         if boundary is None:
             continue
-        try:
-            mask = _selected_boundary_field_signed_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) >= 0.0
-        except Exception:
-            mask = _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
+        mask = boundary_mask(boundary)
         if not np.any(mask):
             continue
-        density = max(0.05, float(spec.get("base_density", base_density)))
-        scale = density / base_density
-        spec_x = x * scale
-        spec_y = y * scale
-        spec_z = z * scale
-        spec_field = np.asarray(evaluate_equation(str(spec.get("equation", equation)), spec_x, spec_y, spec_z), dtype=float)
-        if spec_field.shape == ():
-            spec_field = np.full(field.shape, float(spec_field))
+        spec_field = evaluated_field(spec)
         if spec_field.shape == field.shape:
             field[mask] = spec_field[mask]
         offset_field[mask] = float(spec.get("offset", offset))
+        region_index[mask] = int(spec.get("index", -1))
+
+    for spec in transition_region_specs:
+        boundary = spec.get("boundary_object")
+        source_boundary = spec.get("source_boundary_object")
+        target_boundary = spec.get("target_boundary_object")
+        if boundary is None or source_boundary is None or target_boundary is None:
+            continue
+        mask = boundary_mask(boundary)
+        if not np.any(mask):
+            continue
+        source_field = evaluated_field(spec, "source_equation", "source_base_density")
+        target_field = evaluated_field(spec, "target_equation", "target_base_density")
+        if source_field.shape != field.shape or target_field.shape != field.shape:
+            continue
+        source_distance = boundary_distance(source_boundary)
+        target_distance = boundary_distance(target_boundary)
+        denom = source_distance + target_distance
+        t = np.divide(
+            source_distance,
+            denom,
+            out=np.full(field.shape, 0.5, dtype=float),
+            where=np.isfinite(denom) & (denom > 1e-12),
+        )
+        t = _smoothstep(np.clip(t, 0.0, 1.0))
+        field[mask] = ((1.0 - t) * source_field + t * target_field)[mask]
+        source_offset = float(spec.get("source_offset", offset))
+        target_offset = float(spec.get("target_offset", offset))
+        offset_field[mask] = ((1.0 - t) * source_offset + t * target_offset)[mask]
         region_index[mask] = int(spec.get("index", -1))
 
     for control in transition_controls:
@@ -2449,6 +2525,7 @@ def generate_hybrid_freecad_mesh(
     base_density=1.0,
     region_specs=None,
     transition_controls=None,
+    transition_region_specs=None,
 ):
     polydata = generate_hybrid_polydata(
         equation,
@@ -2467,6 +2544,7 @@ def generate_hybrid_freecad_mesh(
         base_density,
         region_specs,
         transition_controls,
+        transition_region_specs,
     )
     return _prepare_freecad_mesh(
         polydata,

@@ -9,7 +9,10 @@ class TPMSTaskPanel:
         self.obj = obj
         self.generator = tpms_generator
         self.form = QtWidgets.QWidget()
-        self.form.setWindowTitle("TPMS Parameters")
+        role_title = "Base Region Parameters" if str(getattr(obj, "RegionRole", "Base")) == "Base" else "TPMS Region Parameters"
+        if str(getattr(obj, "RegionRole", "Base")) == "Transition":
+            role_title = "Transition Region Parameters"
+        self.form.setWindowTitle(role_title)
 
         layout = QtWidgets.QVBoxLayout(self.form)
 
@@ -97,10 +100,6 @@ class TPMSTaskPanel:
         self.region_role.setCurrentText(str(getattr(obj, "RegionRole", "Base")))
         tpms_layout.addRow("Region role", self.region_role)
 
-        self.base_excludes = QtWidgets.QCheckBox()
-        self.base_excludes.setChecked(bool(getattr(obj, "BaseExcludesRegionSettings", True)))
-        tpms_layout.addRow("Base skips overrides", self.base_excludes)
-
         self.sampling = self._double_spin(float(getattr(obj, "Sampling", 0.0)), 0.0, 100000.0, 0.1)
         self.sampling.setSpecialValueText("Use resolution")
         tpms_layout.addRow("Sampling resolution", self.sampling)
@@ -110,14 +109,6 @@ class TPMSTaskPanel:
         tpms_layout.addRow("Add caps", self.add_caps)
 
         transition_group = self._group(layout, "Transition")
-
-        self.transition_mode = QtWidgets.QComboBox()
-        self.transition_mode.addItems(["None", "Shared face", "Bridge region"])
-        self.transition_mode.setCurrentText(str(getattr(obj, "TransitionMode", "None")))
-        transition_group.addRow("Mode", self.transition_mode)
-
-        self.transition_width = self._double_spin(float(getattr(obj, "TransitionWidth", 0.0)), 0.0, 100000.0, 0.1)
-        transition_group.addRow("Width", self.transition_width)
 
         self.transition_source = self._spin(max(0, int(getattr(obj, "TransitionSourceRegion", 0))), 0, 100000)
         transition_group.addRow("Source region", self.transition_source)
@@ -301,7 +292,6 @@ class TPMSTaskPanel:
         self.boundary_select.clicked.connect(self._use_selected_boundary)
         self.region_mode.currentTextChanged.connect(self._update_region_controls)
         self.region_role.currentTextChanged.connect(self._update_region_controls)
-        self.transition_mode.currentTextChanged.connect(self._update_transition_controls)
         self.origin_select.clicked.connect(self._use_selected_origin)
         self.rotation_select.clicked.connect(self._use_selected_rotation)
         self.boundary_mode.currentTextChanged.connect(self._update_boundary_controls)
@@ -368,12 +358,9 @@ class TPMSTaskPanel:
         self._set_tip(self.boundary_select, "Use the currently selected solid or mesh as the TPMS boundary.")
         self._set_tip(self.region_mode, "For BooleanFragments or compounds with multiple solids, choose whether this TPMS parameter fills all regions or one solid region.")
         self._set_tip(self.region_index, "Solid region used when Boundary regions is set to Single region. Region order comes from the FreeCAD shape solids.")
-        self._set_tip(self.region_role, "Base is the main TPMS setting. Override replaces the base in one region. Transition is reserved for shared-face or bridge-region blending.")
-        self._set_tip(self.base_excludes, "When enabled, the base all-region mesh skips regions covered by override or transition settings.")
-        self._set_tip(self.transition_mode, "None disables transition behavior. Shared face and Bridge region store transition intent for region-aware blending.")
-        self._set_tip(self.transition_width, "Width of a shared-face transition band in document units.")
-        self._set_tip(self.transition_source, "Source region index for shared-face or bridge transition.")
-        self._set_tip(self.transition_target, "Target region index for shared-face or bridge transition.")
+        self._set_tip(self.region_role, "Base is the first region setting. Override defines one fixed TPMS region. Transition blends source and target TPMS fields inside this region.")
+        self._set_tip(self.transition_source, "Source region index for this transition region.")
+        self._set_tip(self.transition_target, "Target region index for this transition region.")
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
         self._set_tip(self.density_mode, "Enable non-uniform unit-cell density grading from selected faces.")
@@ -621,7 +608,6 @@ class TPMSTaskPanel:
         multi_region = boundary_enabled and len(items) > 1
         self.region_mode.setEnabled(multi_region)
         self.region_index.setEnabled(multi_region and self.region_mode.currentText() == "Single region")
-        self.base_excludes.setEnabled(self.region_role.currentText() == "Base")
         self.resolution.setEnabled(self.region_role.currentText() == "Base")
         if items:
             self.region_index.setCurrentIndex(max(0, min(current, len(items) - 1)))
@@ -629,12 +615,46 @@ class TPMSTaskPanel:
             self.region_mode.setCurrentText("All regions")
         if hasattr(self, "region_status"):
             self.region_status.setText(self._region_status_text())
+        if hasattr(self, "transition_source"):
+            self._update_transition_controls()
 
     def _update_transition_controls(self):
-        enabled = self.region_role.currentText() == "Transition" and self.transition_mode.currentText() != "None"
-        self.transition_width.setEnabled(enabled)
+        enabled = self.region_role.currentText() == "Transition"
         self.transition_source.setEnabled(enabled)
         self.transition_target.setEnabled(enabled)
+        transition_role = self.region_role.currentText() == "Transition"
+        for widget in (
+            self.surface,
+            self.equation,
+            self.part,
+            self.offset,
+            self.cell_x,
+            self.cell_y,
+            self.cell_z,
+            self.phase_x,
+            self.phase_y,
+            self.phase_z,
+            self.coordinate_mode,
+            self.ring_radius,
+            self.ring_outer_radius,
+            self.ring_height,
+            self.ring_angular_cells,
+            self.density_mode,
+            self.density_gradient,
+            self.base_density,
+            self.density_count_mode,
+            self.face_density,
+            self.density_transition,
+            self.offset_density_mode,
+            self.offset_density_gradient,
+            self.offset_density_value,
+            self.offset_density_transition,
+            self.grading_resolution,
+            self.harmonic_boundary_condition,
+            self.grading_controls_label,
+            self.add_grading_controls,
+        ):
+            widget.setEnabled(not transition_role)
 
     def _update_coordinate_controls(self):
         ring_mode = self.coordinate_mode.currentText() == self.generator.COORDINATE_CYLINDRICAL_RING
@@ -751,9 +771,6 @@ class TPMSTaskPanel:
             obj.RegionMode = self.region_mode.currentText()
             obj.RegionIndex = int(self.region_index.currentData() or 0)
             obj.RegionRole = self.region_role.currentText()
-            obj.BaseExcludesRegionSettings = bool(self.base_excludes.isChecked())
-            obj.TransitionMode = self.transition_mode.currentText()
-            obj.TransitionWidth = float(self.transition_width.value())
             obj.TransitionSourceRegion = int(self.transition_source.value())
             obj.TransitionTargetRegion = int(self.transition_target.value())
             obj.Sampling = float(self.sampling.value())
@@ -929,9 +946,6 @@ class TPMSTaskPanel:
             obj.RegionMode = self.region_mode.currentText()
             obj.RegionIndex = int(self.region_index.currentData() or 0)
             obj.RegionRole = self.region_role.currentText()
-            obj.BaseExcludesRegionSettings = bool(self.base_excludes.isChecked())
-            obj.TransitionMode = self.transition_mode.currentText()
-            obj.TransitionWidth = float(self.transition_width.value())
             obj.TransitionSourceRegion = int(self.transition_source.value())
             obj.TransitionTargetRegion = int(self.transition_target.value())
             obj.Sampling = float(self.sampling.value())

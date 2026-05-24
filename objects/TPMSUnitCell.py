@@ -8,9 +8,6 @@ REGION_MODE_SINGLE = "Single region"
 REGION_ROLE_BASE = "Base"
 REGION_ROLE_OVERRIDE = "Override"
 REGION_ROLE_TRANSITION = "Transition"
-TRANSITION_MODE_NONE = "None"
-TRANSITION_MODE_SHARED_FACE = "Shared face"
-TRANSITION_MODE_BRIDGE_REGION = "Bridge region"
 
 
 def make_tpms_unit_cell(doc=None):
@@ -22,7 +19,7 @@ def make_tpms_unit_cell(doc=None):
     container.Label = "TPMS Unit Cell"
 
     controller = doc.addObject("Part::FeaturePython", "TPMS_Parameters")
-    controller.Label = "TPMS Parameters"
+    controller.Label = "Base Region Parameters"
     TPMSUnitCell(controller)
     _set_controller_shape(controller)
     if getattr(controller, "ViewObject", None) is not None:
@@ -72,8 +69,6 @@ def make_tpms_unit_cell(doc=None):
     controller.RegionIndex = 0
     controller.RegionRole = REGION_ROLE_BASE
     controller.BaseExcludesRegionSettings = True
-    controller.TransitionMode = TRANSITION_MODE_NONE
-    controller.TransitionWidth = 0.0
     controller.TransitionSourceRegion = 0
     controller.TransitionTargetRegion = 0
     controller.Sampling = 0.0
@@ -114,6 +109,16 @@ def add_tpms_region_settings_for_all_regions(source_controller, skip_existing=Tr
     doc = source_controller.Document
     container = _container_for(source_controller)
     created = []
+    try:
+        first_index = int(items[0]["index"])
+        source_controller.RegionMode = REGION_MODE_ALL
+        source_controller.RegionIndex = first_index
+        source_controller.RegionRole = REGION_ROLE_BASE
+        source_controller.Label = "Base Region Parameters"
+        source_controller.RegionDescription = _region_label_for_index(getattr(source_controller, "BoundaryObject", None), first_index)
+        existing.add(first_index)
+    except Exception:
+        pass
     for item in items:
         index = int(item["index"])
         if index in existing:
@@ -144,9 +149,8 @@ def _configure_region_controller(source_controller, controller, region_index):
     controller.RegionIndex = int(region_index)
     controller.RegionRole = REGION_ROLE_OVERRIDE
     controller.BaseExcludesRegionSettings = True
-    controller.TransitionMode = TRANSITION_MODE_NONE
     controller.RegionDescription = _region_label_for_index(getattr(source_controller, "BoundaryObject", None), region_index)
-    controller.Label = "TPMS Region {}".format(int(region_index) + 1)
+    controller.Label = "Region {} Parameters".format(int(region_index) + 1)
 
 
 def _copy_tpms_settings(source, target):
@@ -486,18 +490,16 @@ class TPMSUnitCell:
         if not hasattr(obj, "BaseExcludesRegionSettings"):
             obj.addProperty("App::PropertyBool", "BaseExcludesRegionSettings", "TPMS", "Base all-region generation skips regions with override or transition settings")
             obj.BaseExcludesRegionSettings = True
-        if not hasattr(obj, "TransitionMode"):
-            obj.addProperty("App::PropertyEnumeration", "TransitionMode", "Transition", "How transition TPMS is defined")
-            obj.TransitionMode = [TRANSITION_MODE_NONE, TRANSITION_MODE_SHARED_FACE, TRANSITION_MODE_BRIDGE_REGION]
-            obj.TransitionMode = TRANSITION_MODE_NONE
-        if not hasattr(obj, "TransitionWidth"):
-            obj.addProperty("App::PropertyFloat", "TransitionWidth", "Transition", "Transition width near shared region faces")
-            obj.TransitionWidth = 0.0
+        obj.setEditorMode("BaseExcludesRegionSettings", 2)
+        if hasattr(obj, "TransitionMode"):
+            obj.setEditorMode("TransitionMode", 2)
+        if hasattr(obj, "TransitionWidth"):
+            obj.setEditorMode("TransitionWidth", 2)
         if not hasattr(obj, "TransitionSourceRegion"):
-            obj.addProperty("App::PropertyInteger", "TransitionSourceRegion", "Transition", "Source region index for bridge transition")
+            obj.addProperty("App::PropertyInteger", "TransitionSourceRegion", "Transition", "Source region index for implicit blending")
             obj.TransitionSourceRegion = 0
         if not hasattr(obj, "TransitionTargetRegion"):
-            obj.addProperty("App::PropertyInteger", "TransitionTargetRegion", "Transition", "Target region index for bridge transition")
+            obj.addProperty("App::PropertyInteger", "TransitionTargetRegion", "Transition", "Target region index for implicit blending")
             obj.TransitionTargetRegion = 0
         if not hasattr(obj, "RegionCount"):
             obj.addProperty("App::PropertyInteger", "RegionCount", "Result", "Detected solid region count in the boundary")
@@ -598,19 +600,9 @@ class TPMSUnitCell:
             origin_rotation = _origin_rotation(obj)
             unit_cell_controls = _unit_cell_controls(obj)
             density_offset_controls = _density_offset_controls(obj)
-            transition_unit_cell_controls, transition_offset_controls, transition_equation_controls, transition_gradient = _transition_controls(obj)
-            if transition_unit_cell_controls:
-                unit_cell_controls = list(unit_cell_controls) + transition_unit_cell_controls
-            if transition_offset_controls:
-                density_offset_controls = list(density_offset_controls) + transition_offset_controls
             effective_base_density = max(0.05, float(getattr(obj, "BaseDensity", 1.0)))
             effective_offset = float(getattr(obj, "Offset", 0.3))
-            transition_source = _transition_endpoint_controller(obj, "source")
             effective_equation = str(getattr(obj, "Equation", ""))
-            if (transition_unit_cell_controls or transition_offset_controls or transition_equation_controls) and transition_source is not None:
-                effective_base_density = max(0.05, float(getattr(transition_source, "BaseDensity", effective_base_density)))
-                effective_offset = float(getattr(transition_source, "Offset", effective_offset))
-                effective_equation = str(getattr(transition_source, "Equation", effective_equation))
             boundary_object, region_description, region_count = selected_boundary_region(obj)
             obj.RegionCount = int(region_count)
             obj.RegionDescription = region_description
@@ -640,16 +632,16 @@ class TPMSUnitCell:
                 bool(getattr(obj, "RelaxCapSurface", False)),
                 origin,
                 origin_rotation,
-                "Non-uniform" if transition_unit_cell_controls else str(getattr(obj, "DensityMode", "Uniform")),
+                str(getattr(obj, "DensityMode", "Uniform")),
                 effective_base_density,
                 unit_cell_controls,
                 str(getattr(obj, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW)),
-                transition_gradient if transition_unit_cell_controls else str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
-                "Non-uniform" if transition_offset_controls else str(getattr(obj, "DensityOffsetMode", "Uniform")),
+                str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                str(getattr(obj, "DensityOffsetMode", "Uniform")),
                 effective_offset,
                 density_offset_controls,
-                transition_gradient if transition_offset_controls else str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
-                transition_equation_controls,
+                str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                None,
                 str(getattr(obj, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
                 max(1e-9, float(getattr(obj, "RingRadius", 25.0))),
                 max(1e-9, float(getattr(obj, "RingOuterRadius", float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))))),
@@ -890,7 +882,7 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
     cell_size = _vector_tuple(getattr(base, "CellSize", App.Vector(10.0, 10.0, 10.0)), fallback=(10.0, 10.0, 10.0), minimum=1e-9)
     phase = _vector_tuple(getattr(base, "Phase", App.Vector(0.0, 0.0, 0.0)), fallback=(0.0, 0.0, 0.0), minimum=None)
     region_specs = _hybrid_region_specs(base, items)
-    transition_controls = _hybrid_transition_controls(base, items)
+    transition_region_specs = _hybrid_transition_region_specs(base, items)
     return tpms_generator.generate_hybrid_freecad_mesh(
         str(getattr(base, "Equation", "")),
         str(getattr(base, "Part", tpms_generator.PART_SHEET)),
@@ -900,7 +892,7 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         float(getattr(base, "Offset", 0.3)),
         phase,
         tpms_generator.BOUNDARY_SELECTED_SOLID,
-        getattr(base, "BoundaryObject", None),
+        _hybrid_outer_boundary(base, items),
         max(0.0, float(getattr(base, "Sampling", 0.0))),
         bool(getattr(base, "AddCaps", True)),
         bool(getattr(base, "MeshRelaxation", False)),
@@ -911,63 +903,92 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         _origin_rotation(base),
         max(0.05, float(getattr(base, "BaseDensity", 1.0))),
         region_specs,
-        transition_controls,
+        [],
+        transition_region_specs,
     )
+
+
+def _hybrid_outer_boundary(base, items):
+    solids = [item["solid"] for item in items if item.get("solid") is not None]
+    if not solids:
+        return getattr(base, "BoundaryObject", None)
+    try:
+        fused = solids[0].multiFuse(solids[1:]) if len(solids) > 1 else solids[0]
+        try:
+            fused = fused.removeSplitter()
+        except Exception:
+            pass
+        if fused is not None and not fused.isNull():
+            return _ShapeBoundaryAdapter(fused, "Outer boundary")
+    except Exception as exc:
+        App.Console.PrintWarning("Falling back to original multi-region boundary for caps: {}\n".format(exc))
+    return getattr(base, "BoundaryObject", None)
 
 
 def _hybrid_region_specs(base, items):
     specs = []
     for item in items:
         setting = _region_generation_setting(base, int(item["index"]))
-        source = _transition_endpoint_controller(setting, "source") if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION else setting
-        if source is None:
-            source = setting
+        if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION:
+            continue
         specs.append(
             {
                 "index": int(item["index"]),
                 "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
-                "equation": str(getattr(source, "Equation", getattr(base, "Equation", ""))),
-                "offset": float(getattr(source, "Offset", getattr(base, "Offset", 0.3))),
-                "base_density": max(0.05, float(getattr(source, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
+                "equation": str(getattr(setting, "Equation", getattr(base, "Equation", ""))),
+                "offset": float(getattr(setting, "Offset", getattr(base, "Offset", 0.3))),
+                "base_density": max(0.05, float(getattr(setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
             }
         )
     return specs
 
 
-def _hybrid_transition_controls(base, items):
-    controls = []
+def _hybrid_transition_region_specs(base, items):
+    specs = []
+    item_by_index = {int(item["index"]): item for item in items}
     for item in items:
-        index = int(item["index"])
-        setting = _region_generation_setting(base, index)
-        for other in items:
-            other_index = int(other["index"])
-            if other_index == index:
-                continue
-            other_setting = _region_generation_setting(base, other_index)
-            if _same_tpms_region_settings(setting, other_setting):
-                continue
-            width = _shared_transition_width(base, index, other_index)
-            for face in _faces_touching_solid(item["solid"], other["solid"]):
-                try:
-                    point, normal = _face_point_normal(face)
-                    surface = _face_surface_mesh(face)
-                except Exception:
-                    continue
-                controls.append(
-                    {
-                        "type": "face_distance",
-                        "source_index": index,
-                        "target_index": other_index,
-                        "point": point,
-                        "normal": normal,
-                        "surface": surface,
-                        "transition": width,
-                        "target_equation": str(getattr(other_setting, "Equation", getattr(base, "Equation", ""))),
-                        "target_density": max(0.05, float(getattr(other_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
-                        "target_offset": float(getattr(other_setting, "Offset", getattr(base, "Offset", 0.3))),
-                    }
-                )
-    return controls
+        region_index = int(item["index"])
+        setting = _region_controller_for(base, region_index, roles=(REGION_ROLE_TRANSITION,))
+        if setting is None:
+            continue
+        source_index = int(getattr(setting, "TransitionSourceRegion", 0))
+        target_index = int(getattr(setting, "TransitionTargetRegion", 0))
+        source_item = item_by_index.get(source_index)
+        target_item = item_by_index.get(target_index)
+        if source_item is None or target_item is None:
+            App.Console.PrintWarning(
+                "Ignoring transition region {}: source or target region is missing.\n".format(region_index + 1)
+            )
+            continue
+        source_setting = _region_endpoint_setting(base, source_index)
+        target_setting = _region_endpoint_setting(base, target_index)
+        specs.append(
+            {
+                "index": region_index,
+                "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
+                "source_index": source_index,
+                "source_boundary_object": _ShapeBoundaryAdapter(source_item["solid"], source_item["label"]),
+                "source_equation": str(getattr(source_setting, "Equation", getattr(base, "Equation", ""))),
+                "source_offset": float(getattr(source_setting, "Offset", getattr(base, "Offset", 0.3))),
+                "source_base_density": max(0.05, float(getattr(source_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
+                "target_index": target_index,
+                "target_boundary_object": _ShapeBoundaryAdapter(target_item["solid"], target_item["label"]),
+                "target_equation": str(getattr(target_setting, "Equation", getattr(base, "Equation", ""))),
+                "target_offset": float(getattr(target_setting, "Offset", getattr(base, "Offset", 0.3))),
+                "target_base_density": max(0.05, float(getattr(target_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
+                "blend": "Implicit function blend",
+            }
+        )
+    return specs
+
+
+def _region_endpoint_setting(base, region_index):
+    override = _region_controller_for(base, region_index, roles=(REGION_ROLE_OVERRIDE,))
+    if override is not None:
+        return override
+    if int(region_index) == int(getattr(base, "RegionIndex", 0)):
+        return base
+    return base
 
 
 def _region_generation_setting(base, region_index):
@@ -978,136 +999,6 @@ def _region_generation_setting(base, region_index):
     if override is not None:
         return override
     return base
-
-
-def _generate_region_mesh(base, setting, item, items, tpms_generator):
-    resolution = max(4, int(getattr(base, "Resolution", 16)))
-    cell_size = _vector_tuple(getattr(setting, "CellSize", getattr(base, "CellSize", App.Vector(10.0, 10.0, 10.0))), fallback=(10.0, 10.0, 10.0), minimum=1e-9)
-    phase = _vector_tuple(getattr(setting, "Phase", getattr(base, "Phase", App.Vector(0.0, 0.0, 0.0))), fallback=(0.0, 0.0, 0.0), minimum=None)
-    boundary = _ShapeBoundaryAdapter(item["solid"], item["label"])
-    unit_cell_controls = _unit_cell_controls(setting)
-    offset_controls = _density_offset_controls(setting)
-    transition_unit, transition_offset, transition_equation, transition_gradient = _region_transition_controls(base, setting, item, items)
-    if transition_unit:
-        unit_cell_controls = list(unit_cell_controls) + transition_unit
-    if transition_offset:
-        offset_controls = list(offset_controls) + transition_offset
-
-    source = _transition_endpoint_controller(setting, "source") if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION else setting
-    if source is None:
-        source = setting
-    equation = str(getattr(source, "Equation", getattr(setting, "Equation", getattr(base, "Equation", ""))))
-    base_density = max(0.05, float(getattr(source, "BaseDensity", getattr(setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))))
-    offset = float(getattr(source, "Offset", getattr(setting, "Offset", getattr(base, "Offset", 0.3))))
-
-    return tpms_generator.generate_freecad_mesh(
-        equation,
-        str(getattr(source, "Part", getattr(setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET)))),
-        cell_size,
-        (1, 1, 1),
-        resolution,
-        offset,
-        phase,
-        bool(getattr(base, "MeshStitching", False)),
-        tpms_generator.BOUNDARY_SELECTED_SOLID,
-        boundary,
-        max(0.0, float(getattr(base, "Sampling", 0.0))),
-        bool(getattr(base, "AddCaps", True)),
-        bool(getattr(base, "MeshRelaxation", False)),
-        max(0, int(getattr(base, "RelaxIterations", 5))),
-        bool(getattr(base, "RelaxSkipBoundary", True)),
-        bool(getattr(base, "RelaxCapSurface", False)),
-        _origin_tuple(base),
-        _origin_rotation(base),
-        "Non-uniform" if transition_unit else str(getattr(setting, "DensityMode", getattr(base, "DensityMode", "Uniform"))),
-        base_density,
-        unit_cell_controls,
-        str(getattr(setting, "DensityCountMode", getattr(base, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW))),
-        transition_gradient if transition_unit else str(getattr(setting, "DensityGradient", getattr(base, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE))),
-        "Non-uniform" if transition_offset else str(getattr(setting, "DensityOffsetMode", getattr(base, "DensityOffsetMode", "Uniform"))),
-        offset,
-        offset_controls,
-        transition_gradient if transition_offset else str(getattr(setting, "DensityOffsetGradient", getattr(base, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE))),
-        transition_equation,
-        str(getattr(base, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
-        max(1e-9, float(getattr(base, "RingRadius", 25.0))),
-        max(1e-9, float(getattr(base, "RingOuterRadius", float(getattr(base, "RingRadius", 25.0)) + float(getattr(base, "RingRadialThickness", 10.0))))),
-        max(1e-9, float(getattr(base, "RingHeight", 10.0))),
-        max(1, int(getattr(base, "RingAngularCells", 8))),
-        max(0, int(getattr(base, "GradingResolution", 16))),
-        str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
-    )
-
-
-def _region_transition_controls(base, setting, item, items):
-    import tpms_generator
-
-    if str(getattr(setting, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_TRANSITION:
-        return _transition_controls(setting)
-
-    index = int(item["index"])
-    solid = item["solid"]
-    width = _shared_transition_width(base, index, None)
-    density_controls = []
-    offset_controls = []
-    equation_controls = []
-    gradient = tpms_generator.GRADIENT_FACE_DISTANCE
-    for other in items:
-        other_index = int(other["index"])
-        if other_index == index:
-            continue
-        other_setting = _region_generation_setting(base, other_index)
-        if other_setting is setting:
-            continue
-        pair_width = _shared_transition_width(base, index, other_index)
-        if pair_width <= 0.0 and _same_tpms_region_settings(setting, other_setting):
-            continue
-        density, offset, equation = _transition_controls_for_touching_faces(
-            solid,
-            other["solid"],
-            other_setting,
-            pair_width if pair_width > 0.0 else width,
-        )
-        density_controls.extend(density)
-        offset_controls.extend(offset)
-        equation_controls.extend(equation)
-    return density_controls, offset_controls, equation_controls, gradient
-
-
-def _same_tpms_region_settings(left, right):
-    return (
-        str(getattr(left, "Equation", "")) == str(getattr(right, "Equation", ""))
-        and abs(float(getattr(left, "BaseDensity", 1.0)) - float(getattr(right, "BaseDensity", 1.0))) <= 1e-9
-        and abs(float(getattr(left, "Offset", 0.3)) - float(getattr(right, "Offset", 0.3))) <= 1e-9
-    )
-
-
-def _shared_transition_width(base, region_a, region_b):
-    width = 0.0
-    container = _container_for(base)
-    boundary = getattr(base, "BoundaryObject", None)
-    for obj in getattr(base.Document, "Objects", []):
-        if not is_tpms_unit_cell(obj):
-            continue
-        if container is not None and _container_for(obj) != container:
-            continue
-        if getattr(obj, "BoundaryObject", None) != boundary:
-            continue
-        if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
-            continue
-        if str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE)) != TRANSITION_MODE_SHARED_FACE:
-            continue
-        source = int(getattr(obj, "TransitionSourceRegion", -1))
-        target = int(getattr(obj, "TransitionTargetRegion", -1))
-        pair_matches = region_b is None or {int(region_a), int(region_b)} == {source, target}
-        if pair_matches and int(region_a) in (source, target, int(getattr(obj, "RegionIndex", -2))):
-            width = max(width, float(getattr(obj, "TransitionWidth", 0.0)))
-    if width > 0.0:
-        return width
-    try:
-        return max(1e-9, 0.5 * min(_vector_tuple(getattr(base, "CellSize", App.Vector(10.0, 10.0, 10.0)), (10.0, 10.0, 10.0), 1e-9)))
-    except Exception:
-        return 5.0
 
 
 class TPMSFaceDensityControl:
@@ -1565,160 +1456,6 @@ def _density_offset_controls(obj):
                 }
             )
     return controls
-
-
-def _transition_endpoint_controller(obj, side):
-    if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
-        return None
-    if str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE)) == TRANSITION_MODE_NONE:
-        return None
-    if side == "source":
-        index = int(getattr(obj, "TransitionSourceRegion", 0))
-    else:
-        index = int(getattr(obj, "TransitionTargetRegion", 0))
-    if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE and index == int(getattr(obj, "RegionIndex", -1)):
-        return obj
-    return _region_controller_for(obj, index) or _base_controller_for(obj)
-
-
-def _transition_controls(obj):
-    import tpms_generator
-
-    if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
-        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
-    mode = str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE))
-    if mode == TRANSITION_MODE_NONE:
-        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
-    if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE:
-        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
-
-    items = boundary_region_items(getattr(obj, "BoundaryObject", None))
-    selected_index = int(getattr(obj, "RegionIndex", 0))
-    selected_solid = _region_solid_from_items(items, selected_index)
-    if selected_solid is None:
-        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
-
-    source_index = int(getattr(obj, "TransitionSourceRegion", selected_index))
-    target_index = int(getattr(obj, "TransitionTargetRegion", 0))
-    source_solid = _region_solid_from_items(items, source_index)
-    target_solid = _region_solid_from_items(items, target_index)
-    source_setting = _transition_endpoint_controller(obj, "source") or obj
-    target_setting = _transition_endpoint_controller(obj, "target") or _base_controller_for(obj)
-
-    width = float(getattr(obj, "TransitionWidth", 0.0))
-    if width <= 0.0:
-        width = max(
-            float(getattr(obj, "DensityTransition", 0.0)),
-            float(getattr(obj, "DensityOffsetTransition", 0.0)),
-            min(_vector_tuple(getattr(obj, "CellSize", App.Vector(10.0, 10.0, 10.0)), (10.0, 10.0, 10.0), 1e-9)) * 0.5,
-        )
-    width = max(width, 1e-9)
-
-    density_controls = []
-    offset_controls = []
-    equation_controls = []
-    if mode == TRANSITION_MODE_BRIDGE_REGION:
-        if source_solid is not None:
-            density, offset, equation = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
-            density_controls.extend(density)
-            offset_controls.extend(offset)
-            equation_controls.extend(equation)
-        if target_solid is not None:
-            density, offset, equation = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
-            density_controls.extend(density)
-            offset_controls.extend(offset)
-            equation_controls.extend(equation)
-        return density_controls, offset_controls, equation_controls, tpms_generator.GRADIENT_HARMONIC
-
-    # Shared-face mode creates a local transition band near the face shared by
-    # the selected region and the opposite endpoint region.
-    if selected_index == source_index and target_solid is not None:
-        density, offset, equation = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
-        density_controls.extend(density)
-        offset_controls.extend(offset)
-        equation_controls.extend(equation)
-    elif selected_index == target_index and source_solid is not None:
-        density, offset, equation = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
-        density_controls.extend(density)
-        offset_controls.extend(offset)
-        equation_controls.extend(equation)
-    else:
-        for other_solid, setting in ((source_solid, source_setting), (target_solid, target_setting)):
-            if other_solid is None:
-                continue
-            density, offset, equation = _transition_controls_for_touching_faces(selected_solid, other_solid, setting, width)
-            density_controls.extend(density)
-            offset_controls.extend(offset)
-            equation_controls.extend(equation)
-    return density_controls, offset_controls, equation_controls, tpms_generator.GRADIENT_FACE_DISTANCE
-
-
-def _region_solid_from_items(items, region_index):
-    for item in items:
-        if int(item["index"]) == int(region_index):
-            return item["solid"]
-    return None
-
-
-def _transition_controls_for_touching_faces(solid, other_solid, setting, transition_width):
-    density_controls = []
-    offset_controls = []
-    equation_controls = []
-    for face in _faces_touching_solid(solid, other_solid):
-        try:
-            point, normal = _face_point_normal(face)
-            surface = _face_surface_mesh(face)
-        except Exception as exc:
-            App.Console.PrintWarning("Ignoring transition face: {}\n".format(exc))
-            continue
-        density_controls.append(
-            {
-                "type": "face_distance",
-                "point": point,
-                "normal": normal,
-                "density": max(0.05, float(getattr(setting, "BaseDensity", 1.0))),
-                "transition": float(transition_width),
-                "surface": surface,
-            }
-        )
-        offset_controls.append(
-            {
-                "type": "face_distance",
-                "point": point,
-                "normal": normal,
-                "offset": float(getattr(setting, "Offset", 0.3)),
-                "transition": float(transition_width),
-                "surface": surface,
-            }
-        )
-        equation = str(getattr(setting, "Equation", "")).strip()
-        if equation:
-            equation_controls.append(
-                {
-                    "type": "face_distance",
-                    "point": point,
-                    "normal": normal,
-                    "equation": equation,
-                    "transition": float(transition_width),
-                    "surface": surface,
-                }
-            )
-    return density_controls, offset_controls, equation_controls
-
-
-def _faces_touching_solid(solid, other_solid):
-    if solid is None or other_solid is None:
-        return []
-    tolerance = _shape_tolerance(solid)
-    faces = []
-    for face in getattr(solid, "Faces", []):
-        try:
-            distance = float(face.distToShape(other_solid)[0])
-        except Exception:
-            continue
-        if distance <= tolerance:
-            faces.append(face)
-    return faces
 
 
 def _shape_tolerance(shape):

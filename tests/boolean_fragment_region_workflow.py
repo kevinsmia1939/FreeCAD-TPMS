@@ -24,7 +24,6 @@ from objects.TPMSUnitCell import (
     boundary_region_items,
     is_tpms_unit_cell,
     make_tpms_unit_cell,
-    _transition_controls,
 )
 
 
@@ -113,22 +112,6 @@ def run_file(path):
             for obj in controllers_before_recompute
             if str(getattr(obj, "RegionMode", "")) == "Single region"
         ]
-        transition_control_count = 0
-        if os.path.basename(path) == "boolean_fragment_density_grading.FCStd" and len(region_settings_before_recompute) >= 2:
-            transition_controller = region_settings_before_recompute[0]
-            target_controller = region_settings_before_recompute[1]
-            transition_controller.RegionRole = REGION_ROLE_TRANSITION
-            transition_controller.TransitionMode = "Shared face"
-            transition_controller.TransitionSourceRegion = int(getattr(transition_controller, "RegionIndex", 0))
-            transition_controller.TransitionTargetRegion = int(getattr(target_controller, "RegionIndex", 0))
-            transition_controller.TransitionWidth = 5.0
-            transition_controller.Resolution = 37
-            target_controller.BaseDensity = 1.8
-            target_controller.Offset = 0.8
-            transition_density, transition_offset, transition_equation, _transition_gradient = _transition_controls(transition_controller)
-            transition_control_count = len(transition_density) + len(transition_offset) + len(transition_equation)
-            if transition_control_count <= 0:
-                raise RuntimeError("{} transition controller did not detect a shared-face transition".format(path))
         doc.recompute()
 
         controllers = [
@@ -141,7 +124,7 @@ def run_file(path):
             for obj in controllers
             if str(getattr(obj, "RegionMode", "")) == "Single region"
         ]
-        if len(single_region) < len(regions):
+        if len(single_region) < max(0, len(regions) - 1):
             raise RuntimeError(
                 "{} has {} region controllers for {} regions".format(
                     path,
@@ -171,6 +154,8 @@ def run_file(path):
                 )
 
         covered_regions = {
+            int(getattr(controller, "RegionIndex", 0))
+        } | {
             int(getattr(obj, "RegionIndex", 0))
             for obj in single_region
             if _role(obj) in (REGION_ROLE_OVERRIDE, REGION_ROLE_TRANSITION)
@@ -197,11 +182,10 @@ def run_file(path):
         if main_facets <= 0:
             raise RuntimeError("{} generated an empty continuous mesh".format(path))
         print(
-            "PASS {} regions={} created={} transition_controls={} main_facets={} main_region='{}' main_bounds={}".format(
+            "PASS {} regions={} created={} main_facets={} main_region='{}' main_bounds={}".format(
                 os.path.basename(path),
                 len(regions),
                 len(created),
-                transition_control_count,
                 main_facets,
                 base_description,
                 tuple(round(value, 6) for value in _mesh_bounds(controller.ResultMesh)) if _mesh_facet_count(controller) else (),
@@ -211,9 +195,129 @@ def run_file(path):
         App.closeDocument(doc.Name)
 
 
+def _has_degenerate_facets(mesh, tolerance=1e-12):
+    try:
+        for facet in mesh.Facets:
+            points = facet.Points
+            if len(points) != 3:
+                return True
+            a, b, c = points
+            ab = b.sub(a)
+            ac = c.sub(a)
+            if ab.cross(ac).Length * 0.5 <= tolerance:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _assert_transition_weight_varies(source_solid, transition_solid, target_solid):
+    import numpy as np
+    import tpms_generator as generator
+
+    bb = transition_solid.BoundBox
+    xs = np.linspace(float(bb.XMin) + 0.5, float(bb.XMax) - 0.5, 9)
+    ys = np.full(xs.shape, 0.5 * (float(bb.YMin) + float(bb.YMax)))
+    zs = np.full(xs.shape, 0.5 * (float(bb.ZMin) + float(bb.ZMax)))
+    wx = xs.reshape((-1, 1, 1))
+    wy = ys.reshape((-1, 1, 1))
+    wz = zs.reshape((-1, 1, 1))
+    source_distance = generator._selected_boundary_distance_vtk(
+        _BoundaryProbe(source_solid),
+        wx,
+        wy,
+        wz,
+        0.0,
+        16,
+    ).ravel()
+    target_distance = generator._selected_boundary_distance_vtk(
+        _BoundaryProbe(target_solid),
+        wx,
+        wy,
+        wz,
+        0.0,
+        16,
+    ).ravel()
+    weight = source_distance / (source_distance + target_distance)
+    if float(np.max(weight) - np.min(weight)) < 0.5:
+        raise RuntimeError("Transition blend weight is nearly constant: {}".format(weight.tolist()))
+    if not (weight[0] < 0.2 and weight[-1] > 0.8):
+        raise RuntimeError("Transition blend weight does not span source to target: {}".format(weight.tolist()))
+
+
+class _BoundaryProbe:
+    def __init__(self, shape):
+        self.Shape = shape
+
+
+def run_generated_transition_region_case():
+    import Part
+
+    doc = App.newDocument("TPMS_transition_region_test")
+    try:
+        solids = [
+            Part.makeBox(10.0, 10.0, 10.0, App.Vector(0.0, 0.0, 0.0)),
+            Part.makeBox(10.0, 10.0, 10.0, App.Vector(10.0, 0.0, 0.0)),
+            Part.makeBox(10.0, 10.0, 10.0, App.Vector(20.0, 0.0, 0.0)),
+        ]
+        boundary = doc.addObject("Part::Feature", "Three_Region_Fragment")
+        boundary.Label = "Three Region BooleanFragments Equivalent"
+        boundary.Shape = Part.makeCompound(solids)
+
+        _container, controller, _mesh_obj = make_tpms_unit_cell(doc)
+        _configure_fast(controller, boundary)
+        controller.Resolution = 10
+        controller.AddCaps = True
+        controller.RegionIndex = 0
+        controller.Label = "Base Region Parameters"
+        created = add_tpms_region_settings_for_all_regions(controller, skip_existing=True)
+        if len(created) != 2:
+            raise RuntimeError("Expected 2 region settings after base region, got {}".format(len(created)))
+
+        settings = {
+            int(getattr(obj, "RegionIndex", -1)): obj
+            for obj, _mesh in created
+        }
+        transition = settings[1]
+        target = settings[2]
+        transition.RegionRole = REGION_ROLE_TRANSITION
+        transition.TransitionSourceRegion = 0
+        transition.TransitionTargetRegion = 2
+        target.Surface = "Schwarz P"
+        target.Equation = tpms_generator.SURFACE_EQUATIONS["Schwarz P"]
+        target.BaseDensity = 1.35
+        target.Offset = 0.65
+        _assert_transition_weight_varies(solids[0], solids[1], solids[2])
+
+        doc.recompute()
+        mesh_obj = controller.ResultMesh
+        if mesh_obj is None or mesh_obj.Mesh.CountFacets <= 0:
+            raise RuntimeError("Transition-region case generated an empty mesh")
+        if list(getattr(controller, "ResultRegionMeshes", [])):
+            raise RuntimeError("Transition-region case generated per-region meshes")
+        for obj in settings.values():
+            if getattr(obj, "ResultMesh", None) is not None:
+                raise RuntimeError("{} owns an independent mesh".format(obj.Label))
+        if mesh_obj.Mesh.hasNonManifolds():
+            raise RuntimeError("Transition-region case has non-manifold points")
+        if _has_degenerate_facets(mesh_obj.Mesh):
+            raise RuntimeError("Transition-region case has degenerate facets")
+        print(
+            "PASS generated_transition_region regions=3 created={} main_facets={} solid={} non_manifold={}".format(
+                len(created),
+                int(mesh_obj.Mesh.CountFacets),
+                bool(mesh_obj.Mesh.isSolid()),
+                bool(mesh_obj.Mesh.hasNonManifolds()),
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def main():
     for name in TEST_FILES:
         run_file(os.path.join(STUDY_DIR, name))
+    run_generated_transition_region_case()
 
 
 if not getattr(App, "_tpms_boolean_fragment_region_workflow_ran", False):
