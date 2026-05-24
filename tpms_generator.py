@@ -25,11 +25,19 @@ PART_UPPER = "Upper skeletal"
 PART_LOWER = "Lower skeletal"
 PART_SURFACE = "Zero surface"
 
+COORDINATE_CARTESIAN = "Cartesian"
+COORDINATE_CYLINDRICAL_RING = "Cylindrical ring"
+
 BOUNDARY_BOX = "Box"
 BOUNDARY_SPHERE = "Sphere"
 BOUNDARY_SELECTED_SOLID = "Selected solid"
 DENSITY_COUNT_PRESERVE = "Preserve overall count"
-DENSITY_COUNT_FOLLOW = "Follow density settings"
+DENSITY_COUNT_FOLLOW = "Follow unit cell density"
+GRADIENT_FACE_DISTANCE = "Selected-face distance field"
+GRADIENT_FACE_PLANE = "Face plane"
+GRADIENT_HARMONIC = "Harmonic field"
+HARMONIC_BOUNDARY_CONDUCTOR = "Conductor"
+HARMONIC_BOUNDARY_INSULATOR = "Insulator"
 
 _BOUNDARY_FIELD_CACHE = {}
 _BOUNDARY_FIELD_CACHE_ORDER = []
@@ -96,9 +104,53 @@ def boundary_modes():
     return [BOUNDARY_BOX, BOUNDARY_SELECTED_SOLID]
 
 
+def coordinate_modes():
+    return [COORDINATE_CARTESIAN, COORDINATE_CYLINDRICAL_RING]
+
+
 def _make_axis(minimum, maximum, default_count):
     count = max(2, int(default_count))
     return np.linspace(float(minimum), float(maximum), count)
+
+
+def _rectilinear_axes(wx, wy, wz):
+    if wx.ndim != 3 or wy.ndim != 3 or wz.ndim != 3:
+        return None
+    x_axis = np.asarray(wx[:, 0, 0], dtype=float)
+    y_axis = np.asarray(wy[0, :, 0], dtype=float)
+    z_axis = np.asarray(wz[0, 0, :], dtype=float)
+    if (
+        np.allclose(wx, x_axis[:, None, None])
+        and np.allclose(wy, y_axis[None, :, None])
+        and np.allclose(wz, z_axis[None, None, :])
+    ):
+        return x_axis, y_axis, z_axis
+    return None
+
+
+def _coarse_axes_for_harmonic(axes, target_resolution):
+    resolution = int(target_resolution)
+    if resolution <= 0:
+        return None
+    lengths = [max(abs(float(axis[-1] - axis[0])), 1e-9) for axis in axes]
+    spacing = max(lengths) / max(float(resolution), 1.0)
+    counts = [min(len(axes[i]), max(3, int(math.ceil(lengths[i] / spacing)) + 1)) for i in range(3)]
+    if all(counts[i] >= len(axes[i]) for i in range(3)):
+        return None
+    return tuple(_make_axis(float(axes[i][0]), float(axes[i][-1]), counts[i]) for i in range(3))
+
+
+def _interpolate_rectilinear_field(source_axes, source_values, target_axes):
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+    except Exception as exc:
+        App.Console.PrintWarning("SciPy interpolation unavailable; using full-resolution harmonic field: {}\n".format(exc))
+        return None
+
+    interpolator = RegularGridInterpolator(source_axes, source_values, bounds_error=False, fill_value=None)
+    tx, ty, tz = np.meshgrid(*target_axes, indexing="ij")
+    points = np.column_stack((tx.ravel(order="C"), ty.ravel(order="C"), tz.ravel(order="C")))
+    return interpolator(points).reshape(tx.shape, order="C")
 
 
 def _shape_bounds(boundary_object):
@@ -137,6 +189,13 @@ def _make_grid(
     base_density=1.0,
     density_controls=None,
     density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_value=0.3,
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     cell_size = np.asarray(cell_size, dtype=float)
     repeat_cell = np.asarray(repeat_cell, dtype=int)
@@ -196,12 +255,32 @@ def _make_grid(
         base_density,
         density_controls,
         density_count_mode,
+        density_gradient,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        grading_resolution,
+        harmonic_boundary_condition,
+    )
+    offset_field = _offset_field(
+        wx,
+        wy,
+        wz,
+        float(density_offset_value),
+        density_offset_mode,
+        density_offset_controls,
+        density_offset_gradient,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        grading_resolution,
+        harmonic_boundary_condition,
     )
     kx, ky, kz = [2.0 * math.pi / max(cell_size[i], 1e-9) for i in range(3)]
     sx = kx * px
     sy = ky * py
     sz = kz * pz
-    return grid, sx, sy, sz, wx, wy, wz
+    return grid, sx, sy, sz, offset_field, wx, wy, wz
 
 
 def _default_origin(boundary_mode, boundary_object):
@@ -265,6 +344,76 @@ def _density_multiplier(wx, wy, wz, density_mode="Uniform", base_density=1.0, de
     return np.maximum(density, 0.05)
 
 
+def _offset_field(
+    wx,
+    wy,
+    wz,
+    base_offset,
+    density_offset_mode,
+    density_offset_controls,
+    density_offset_gradient,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+):
+    offset = np.full(wx.shape, float(base_offset), dtype=float)
+    if str(density_offset_mode) != "Non-uniform" or not density_offset_controls:
+        return offset
+
+    gradient = str(density_offset_gradient)
+    if gradient == GRADIENT_HARMONIC:
+        return _harmonic_interpolated_field(
+            wx,
+            wy,
+            wz,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            density_offset_controls,
+            float(base_offset),
+            "offset",
+            minimum=None,
+            grading_resolution=grading_resolution,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+
+    for control in density_offset_controls:
+        try:
+            if control.get("type", "face_plane") == "face_distance":
+                offset = _apply_face_distance_offset_field(offset, wx, wy, wz, control, base_offset)
+                continue
+            point = np.asarray(control["point"], dtype=float)
+            normal = np.asarray(control["normal"], dtype=float)
+            target = float(control.get("offset", base_offset))
+            transition = max(1e-9, float(control.get("transition", 1.0)))
+        except Exception:
+            continue
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-12:
+            continue
+        normal = normal / norm
+        distance = np.abs(
+            (wx - point[0]) * normal[0]
+            + (wy - point[1]) * normal[1]
+            + (wz - point[2]) * normal[2]
+        )
+        t = np.clip(distance / transition, 0.0, 1.0)
+        smooth = t * t * (3.0 - 2.0 * t)
+        weight = 1.0 - smooth
+        offset += weight * (target - base_offset)
+    return offset
+
+
+def _apply_face_distance_offset_field(offset, wx, wy, wz, control, base_offset):
+    distance = np.abs(_face_distance_field(wx, wy, wz, control))
+    target = float(control.get("offset", base_offset))
+    transition = max(1e-9, float(control.get("transition", 1.0)))
+    weight = _smooth_falloff_weight(distance, transition)
+    return offset + weight * (target - base_offset)
+
+
 def _density_phase_coordinates(
     tx,
     ty,
@@ -277,6 +426,12 @@ def _density_phase_coordinates(
     base_density=1.0,
     density_controls=None,
     density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     base = max(0.05, float(base_density))
     px = base * (tx + phase[0])
@@ -285,6 +440,23 @@ def _density_phase_coordinates(
 
     if str(density_mode) != "Non-uniform" or not density_controls:
         return px, py, pz
+
+    if str(density_gradient) == GRADIENT_HARMONIC:
+        density = _harmonic_interpolated_field(
+            wx,
+            wy,
+            wz,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            density_controls,
+            base,
+            "density",
+            minimum=0.05,
+            grading_resolution=grading_resolution,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+        return (tx + phase[0]) * density, (ty + phase[1]) * density, (tz + phase[2]) * density
 
     if str(density_count_mode) == DENSITY_COUNT_PRESERVE:
         density = _density_multiplier(wx, wy, wz, density_mode, base_density, density_controls)
@@ -355,7 +527,7 @@ def _control_surface_polydata(control):
     points = np.asarray(surface.get("points", []), dtype=float)
     triangles = surface.get("triangles", [])
     if len(points) == 0 or len(triangles) == 0:
-        raise ValueError("selected face density control has no tessellated surface")
+        raise ValueError("selected face grading control has no tessellated surface")
     face_array = np.empty(len(triangles) * 4, dtype=np.int64)
     face_array[0::4] = 3
     for index, triangle in enumerate(triangles):
@@ -368,6 +540,218 @@ def _smooth_falloff_weight(distance, transition):
     t = np.clip(distance / max(float(transition), 1e-12), 0.0, 1.0)
     smooth = t * t * (3.0 - 2.0 * t)
     return 1.0 - smooth
+
+
+def _harmonic_interpolated_field(
+    wx,
+    wy,
+    wz,
+    boundary_mode,
+    boundary_object,
+    sampling,
+    controls,
+    base_value,
+    value_key,
+    minimum=0.0,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+):
+    axes = _rectilinear_axes(wx, wy, wz)
+    coarse_axes = _coarse_axes_for_harmonic(axes, grading_resolution) if axes is not None else None
+    if coarse_axes is not None:
+        cwx, cwy, cwz = np.meshgrid(*coarse_axes, indexing="ij")
+        coarse = _harmonic_interpolated_field(
+            cwx,
+            cwy,
+            cwz,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            controls,
+            base_value,
+            value_key,
+            minimum=minimum,
+            grading_resolution=0,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+        interpolated = _interpolate_rectilinear_field(coarse_axes, coarse, axes)
+        if interpolated is not None:
+            return interpolated
+
+    lower_bound = None if minimum is None else float(minimum)
+    inside = _domain_inside_mask(boundary_mode, boundary_object, wx, wy, wz, sampling)
+    if not np.any(inside):
+        value = float(base_value) if lower_bound is None else max(lower_bound, float(base_value))
+        return np.full(wx.shape, value, dtype=float)
+
+    if str(harmonic_boundary_condition) == HARMONIC_BOUNDARY_INSULATOR:
+        fixed = np.zeros(wx.shape, dtype=bool)
+    else:
+        fixed = _domain_boundary_mask(inside)
+    values = np.full(wx.shape, float(base_value), dtype=float)
+
+    selected_fixed = np.zeros(wx.shape, dtype=bool)
+    selected_values = np.zeros(wx.shape, dtype=float)
+    selected_counts = np.zeros(wx.shape, dtype=float)
+    band = 1.5 * max(
+        _axis_spacing(wx, axis=0),
+        _axis_spacing(wy, axis=1),
+        _axis_spacing(wz, axis=2),
+    )
+
+    for control in controls or []:
+        try:
+            target = float(control.get(value_key, base_value))
+            if control.get("surface"):
+                distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            else:
+                point = np.asarray(control["point"], dtype=float)
+                normal = np.asarray(control["normal"], dtype=float)
+                normal_length = float(np.linalg.norm(normal))
+                if normal_length <= 1e-12:
+                    continue
+                normal = normal / normal_length
+                distance = np.abs(
+                    (wx - point[0]) * normal[0]
+                    + (wy - point[1]) * normal[1]
+                    + (wz - point[2]) * normal[2]
+                )
+        except Exception:
+            continue
+        mask = inside & (distance <= band)
+        if not np.any(mask):
+            closest = inside & (distance <= max(float(np.min(distance[inside])) + 1e-12, band))
+            mask = closest
+        selected_fixed |= mask
+        selected_values[mask] += target
+        selected_counts[mask] += 1.0
+
+    if np.any(selected_fixed):
+        values[selected_fixed] = selected_values[selected_fixed] / np.maximum(selected_counts[selected_fixed], 1.0)
+        fixed |= selected_fixed
+
+    unknown = inside & ~fixed
+    if not np.any(unknown):
+        return values if lower_bound is None else np.maximum(values, lower_bound)
+
+    solved = _solve_harmonic_grid(inside, fixed, values)
+    return solved if lower_bound is None else np.maximum(solved, lower_bound)
+
+
+def _domain_inside_mask(boundary_mode, boundary_object, wx, wy, wz, sampling):
+    if boundary_mode == BOUNDARY_BOX:
+        return np.ones(wx.shape, dtype=bool)
+    if boundary_mode == BOUNDARY_SPHERE:
+        center = np.array(
+            [
+                0.5 * (float(np.min(wx)) + float(np.max(wx))),
+                0.5 * (float(np.min(wy)) + float(np.max(wy))),
+                0.5 * (float(np.min(wz)) + float(np.max(wz))),
+            ]
+        )
+        radius = 0.5 * min(
+            float(np.max(wx)) - float(np.min(wx)),
+            float(np.max(wy)) - float(np.min(wy)),
+            float(np.max(wz)) - float(np.min(wz)),
+        )
+        return ((wx - center[0]) ** 2 + (wy - center[1]) ** 2 + (wz - center[2]) ** 2) <= radius * radius
+    if boundary_mode == BOUNDARY_SELECTED_SOLID and boundary_object is not None:
+        field = _analytic_boundary_field(boundary_object, wx, wy, wz)
+        if field is not None:
+            return field >= 0.0
+        fallback_resolution = max(wx.shape)
+        try:
+            field = _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+            return field >= 0.0
+        except Exception:
+            if hasattr(boundary_object, "Shape"):
+                return _selected_solid_field(boundary_object.Shape, wx, wy, wz, 1e-7) >= 0.0
+    return np.ones(wx.shape, dtype=bool)
+
+
+def _domain_boundary_mask(inside):
+    boundary = np.zeros(inside.shape, dtype=bool)
+    boundary[0, :, :] |= inside[0, :, :]
+    boundary[-1, :, :] |= inside[-1, :, :]
+    boundary[:, 0, :] |= inside[:, 0, :]
+    boundary[:, -1, :] |= inside[:, -1, :]
+    boundary[:, :, 0] |= inside[:, :, 0]
+    boundary[:, :, -1] |= inside[:, :, -1]
+
+    for axis in range(3):
+        lower = [slice(None)] * 3
+        upper = [slice(None)] * 3
+        lower[axis] = slice(0, -1)
+        upper[axis] = slice(1, None)
+        neighbor_outside = inside[tuple(lower)] != inside[tuple(upper)]
+        boundary[tuple(lower)] |= inside[tuple(lower)] & neighbor_outside
+        boundary[tuple(upper)] |= inside[tuple(upper)] & neighbor_outside
+    return boundary
+
+
+def _solve_harmonic_grid(inside, fixed, fixed_values):
+    try:
+        from scipy import sparse
+        from scipy.sparse import linalg as spla
+    except Exception as exc:
+        App.Console.PrintWarning("SciPy sparse solver unavailable; harmonic field falls back to fixed values: {}\n".format(exc))
+        return fixed_values.copy()
+
+    unknown = inside & ~fixed
+    indices = -np.ones(inside.shape, dtype=np.int64)
+    indices[unknown] = np.arange(int(np.count_nonzero(unknown)), dtype=np.int64)
+    n_unknown = int(np.count_nonzero(unknown))
+    rows = []
+    cols = []
+    data = []
+    rhs = np.zeros(n_unknown, dtype=float)
+
+    neighbor_offsets = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
+    for i, j, k in np.argwhere(unknown):
+        row = int(indices[i, j, k])
+        diagonal = 0.0
+        for di, dj, dk in neighbor_offsets:
+            ni, nj, nk = int(i + di), int(j + dj), int(k + dk)
+            if ni < 0 or nj < 0 or nk < 0 or ni >= inside.shape[0] or nj >= inside.shape[1] or nk >= inside.shape[2]:
+                continue
+            if not inside[ni, nj, nk]:
+                continue
+            diagonal += 1.0
+            if fixed[ni, nj, nk]:
+                rhs[row] += float(fixed_values[ni, nj, nk])
+            else:
+                col = int(indices[ni, nj, nk])
+                if col >= 0:
+                    rows.append(row)
+                    cols.append(col)
+                    data.append(-1.0)
+        rows.append(row)
+        cols.append(row)
+        data.append(max(diagonal, 1.0))
+
+    matrix = sparse.csr_matrix((data, (rows, cols)), shape=(n_unknown, n_unknown))
+    try:
+        import pyamg
+
+        ml = pyamg.smoothed_aggregation_solver(matrix)
+        solution = ml.solve(rhs, tol=1e-8, maxiter=100, accel="cg")
+        result = fixed_values.copy()
+        result[unknown] = solution
+        return result
+    except Exception as exc:
+        App.Console.PrintWarning("PyAMG harmonic solve unavailable; falling back to SciPy direct solve: {}\n".format(exc))
+
+    try:
+        solution = spla.spsolve(matrix, rhs)
+    except Exception as exc:
+        App.Console.PrintWarning("Direct harmonic solve failed; trying conjugate gradient: {}\n".format(exc))
+        solution, info = spla.cg(matrix, rhs, rtol=1e-8, atol=1e-10, maxiter=max(1000, n_unknown * 2))
+        if info != 0:
+            App.Console.PrintWarning("Conjugate-gradient harmonic solve did not fully converge (info={}).\n".format(info))
+
+    result = fixed_values.copy()
+    result[unknown] = solution
+    return result
 
 
 def _selected_solid_field(shape, wx, wy, wz, tolerance):
@@ -538,8 +922,16 @@ def _axis_spacing(values, axis):
 
 
 def _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object=None, sampling=0.0):
-    if boundary_mode == BOUNDARY_BOX:
+    field = _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling)
+    if field is None:
         return False
+    grid["boundary"] = field.ravel(order="F")
+    return True
+
+
+def _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling=0.0):
+    if boundary_mode == BOUNDARY_BOX:
+        return None
     if boundary_mode == BOUNDARY_SPHERE:
         center = np.array(
             [
@@ -559,8 +951,7 @@ def _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object=None, s
             raise ValueError("Selected boundary needs a linked solid or mesh object")
         field = _analytic_boundary_field(boundary_object, wx, wy, wz)
         if field is not None:
-            grid["boundary"] = field.ravel(order="F")
-            return True
+            return field
         try:
             fallback_resolution = max(wx.shape)
             field = _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution)
@@ -579,8 +970,7 @@ def _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object=None, s
     else:
         raise ValueError("Unsupported boundary mode: {}".format(boundary_mode))
 
-    grid["boundary"] = field.ravel(order="F")
-    return True
+    return field
 
 
 def _analytic_boundary_field(boundary_object, wx, wy, wz):
@@ -621,6 +1011,10 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
         if sphere_shell is not None:
             lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
             return _spherical_shell_field(lx, ly, lz, *sphere_shell)
+        conical_shell = _conical_inner_cylindrical_shell_from_shape(boundary_object.Shape)
+        if conical_shell is not None:
+            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+            return _conical_inner_cylindrical_shell_field(lx, ly, lz, *conical_shell)
         shell = _cylindrical_shell_from_shape(boundary_object.Shape)
         if shell is not None:
             lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
@@ -652,8 +1046,11 @@ def _cylindrical_shell_from_shape(shape):
     cylinders = []
     for face in shape.Faces:
         surface = face.Surface
-        if type(surface).__name__ != "Cylinder" or not hasattr(surface, "Radius"):
+        surface_type = type(surface).__name__
+        if surface_type == "Plane":
             continue
+        if surface_type != "Cylinder" or not hasattr(surface, "Radius"):
+            return None
         try:
             umin, umax, _vmin, _vmax = face.ParameterRange
         except Exception:
@@ -701,6 +1098,94 @@ def _cylindrical_shell_from_shape(shape):
     inner_radius = radii[0] if len(radii) == 2 else 0.0
     outer_radius = radii[-1]
     return tuple(center), tuple(axis), outer_radius, inner_radius, hmin, hmax
+
+
+def _conical_inner_cylindrical_shell_from_shape(shape):
+    if shape is None or shape.isNull():
+        return None
+
+    cylinders = []
+    cones = []
+    for face in shape.Faces:
+        surface = face.Surface
+        surface_type = type(surface).__name__
+        if surface_type == "Plane":
+            continue
+        try:
+            umin, umax, _vmin, _vmax = face.ParameterRange
+        except Exception:
+            return None
+        if abs(abs(float(umax) - float(umin)) - 2.0 * math.pi) > 1e-5:
+            return None
+        if surface_type == "Cylinder" and hasattr(surface, "Radius"):
+            axis = _unit_array(surface.Axis)
+            if axis is None:
+                return None
+            cylinders.append((float(surface.Radius), _vector_array(surface.Center), axis))
+        elif surface_type == "Cone" and hasattr(surface, "Radius") and hasattr(surface, "SemiAngle"):
+            axis = _unit_array(surface.Axis)
+            if axis is None:
+                return None
+            cones.append(
+                (
+                    float(surface.Radius),
+                    float(surface.SemiAngle),
+                    _vector_array(surface.Center),
+                    axis,
+                )
+            )
+        else:
+            return None
+
+    if len(cylinders) != 1 or len(cones) != 1:
+        return None
+
+    outer_radius, center, axis = cylinders[0]
+    cone_radius, cone_angle, cone_center, cone_axis = cones[0]
+    if outer_radius <= 1e-9:
+        return None
+    if abs(abs(float(np.dot(axis, cone_axis))) - 1.0) > 1e-6:
+        return None
+    tolerance = max(outer_radius * 1e-6, 1e-7)
+    offset = cone_center - center
+    radial_offset = offset - np.dot(offset, axis) * axis
+    if float(np.linalg.norm(radial_offset)) > tolerance:
+        return None
+
+    projections = []
+    for vertex in shape.Vertexes:
+        point = _vector_array(vertex.Point)
+        projections.append(float(np.dot(point - center, axis)))
+    if not projections:
+        return None
+    hmin = min(projections)
+    hmax = max(projections)
+    if hmax - hmin <= 1e-9:
+        return None
+
+    slope = math.tan(float(cone_angle))
+    test_inner = _conical_radius_at_axial(
+        np.array((hmin, hmax), dtype=float),
+        center,
+        axis,
+        cone_center,
+        cone_axis,
+        cone_radius,
+        slope,
+    )
+    if np.any(test_inner < -tolerance) or np.any(test_inner >= outer_radius - tolerance):
+        return None
+    return (
+        tuple(center),
+        tuple(axis),
+        float(outer_radius),
+        float(hmin),
+        float(hmax),
+        tuple(cone_center),
+        tuple(cone_axis),
+        float(cone_radius),
+        float(slope),
+    )
 
 
 def _spherical_shell_from_shape(shape):
@@ -764,6 +1249,69 @@ def _cylindrical_shell_field(px, py, pz, center, axis, outer_radius, inner_radiu
 
     inner_radius = max(0.0, float(inner_radius))
     outer_radius = max(inner_radius + 1e-12, float(outer_radius))
+    lower = float(hmin)
+    upper = float(hmax)
+
+    inside_distance = np.minimum.reduce(
+        (
+            radial - inner_radius,
+            outer_radius - radial,
+            axial - lower,
+            upper - axial,
+        )
+    )
+    radial_outside = np.maximum(inner_radius - radial, 0.0) + np.maximum(radial - outer_radius, 0.0)
+    axial_outside = np.maximum(lower - axial, 0.0) + np.maximum(axial - upper, 0.0)
+    outside = np.sqrt(radial_outside * radial_outside + axial_outside * axial_outside)
+    return np.where(inside_distance >= 0.0, inside_distance, -outside)
+
+
+def _conical_radius_at_axial(axial, center, axis, cone_center, cone_axis, cone_radius, slope):
+    center = np.asarray(center, dtype=float)
+    axis = np.asarray(axis, dtype=float)
+    cone_center = np.asarray(cone_center, dtype=float)
+    cone_axis = np.asarray(cone_axis, dtype=float)
+    origin_projection = float(np.dot(center - cone_center, cone_axis))
+    axis_projection = float(np.dot(axis, cone_axis))
+    cone_axial = origin_projection + np.asarray(axial, dtype=float) * axis_projection
+    return float(cone_radius) + cone_axial * float(slope)
+
+
+def _conical_inner_cylindrical_shell_field(
+    px,
+    py,
+    pz,
+    center,
+    axis,
+    outer_radius,
+    hmin,
+    hmax,
+    cone_center,
+    cone_axis,
+    cone_radius,
+    cone_slope,
+):
+    center = np.asarray(center, dtype=float)
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+    dx = px - center[0]
+    dy = py - center[1]
+    dz = pz - center[2]
+    axial = dx * axis[0] + dy * axis[1] + dz * axis[2]
+    radial_sq = dx * dx + dy * dy + dz * dz - axial * axial
+    radial = np.sqrt(np.maximum(radial_sq, 0.0))
+
+    inner_radius = _conical_radius_at_axial(
+        axial,
+        center,
+        axis,
+        cone_center,
+        np.asarray(cone_axis, dtype=float) / max(float(np.linalg.norm(cone_axis)), 1e-12),
+        cone_radius,
+        cone_slope,
+    )
+    outer_radius = max(float(outer_radius), 1e-12)
     lower = float(hmin)
     upper = float(hmax)
 
@@ -907,9 +1455,16 @@ def generate_polydata(
     base_density=1.0,
     density_controls=None,
     density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_value=0.3,
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     configure_vtk_smp()
-    grid, x, y, z, wx, wy, wz = _make_grid(
+    grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
         cell_size,
         repeat_cell,
         resolution,
@@ -923,14 +1478,23 @@ def generate_polydata(
         base_density,
         density_controls,
         density_count_mode,
+        density_gradient,
+        density_offset_mode,
+        density_offset_value,
+        density_offset_controls,
+        density_offset_gradient,
+        grading_resolution,
+        harmonic_boundary_condition,
     )
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
         field = np.full(x.shape, float(field))
 
+    if offset_field.shape != field.shape:
+        offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
     grid["surface"] = field.ravel(order="F")
-    grid["lower_surface"] = (field + 0.5 * float(offset)).ravel(order="F")
-    grid["upper_surface"] = (field - 0.5 * float(offset)).ravel(order="F")
+    grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
+    grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
     has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
 
     if not add_caps:
@@ -954,6 +1518,278 @@ def generate_polydata(
     if part == PART_SURFACE:
         return grid.contour(isosurfaces=[0.0], scalars="surface").extract_surface().clean().triangulate()
     raise ValueError("Unsupported TPMS part: {}".format(part))
+
+
+def generate_cylindrical_ring_polydata(
+    equation,
+    part=PART_SHEET,
+    cell_size=(10.0, 10.0, 10.0),
+    resolution=16,
+    offset=0.3,
+    phase=(0.0, 0.0, 0.0),
+    add_caps=True,
+    origin=None,
+    origin_rotation=None,
+    ring_radius=25.0,
+    ring_outer_radius=35.0,
+    ring_height=10.0,
+    ring_angular_cells=8,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_value=0.3,
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+):
+    configure_vtk_smp()
+    cell_size = np.asarray(cell_size, dtype=float)
+    phase = np.asarray(phase, dtype=float)
+    origin = np.asarray(origin if origin is not None else (0.0, 0.0, 0.0), dtype=float)
+
+    inner_radius = max(float(ring_radius), 1e-9)
+    outer_radius = max(float(ring_outer_radius), inner_radius + 1e-9)
+    radial_thickness = outer_radius - inner_radius
+    radius = inner_radius + 0.5 * radial_thickness
+    height = max(float(ring_height), 1e-9)
+    angular_cells = max(1, int(ring_angular_cells))
+    circumference = 2.0 * math.pi * radius
+    angular_cell_size = circumference / float(angular_cells)
+    radial_cell_size = max(float(cell_size[1]), 1e-9)
+    height_cell_size = max(float(cell_size[2]), 1e-9)
+
+    nu = int(resolution) * angular_cells + 1
+    nv = max(3, int(math.ceil(radial_thickness / radial_cell_size * int(resolution))) + 1)
+    nw = max(3, int(math.ceil(height / height_cell_size * int(resolution))) + 1)
+
+    u_coords = _make_axis(0.0, circumference, nu)
+    v_coords = _make_axis(-0.5 * radial_thickness, 0.5 * radial_thickness, nv)
+    h_coords = _make_axis(0.0, height, nw)
+    u, v, h = np.meshgrid(u_coords, v_coords, h_coords, indexing="ij")
+
+    local_x, local_y, local_z = _cylindrical_ring_local_arrays(u, v, h, radius, circumference)
+    rotation_matrix = _rotation_matrix(origin_rotation)
+    if rotation_matrix is not None:
+        wx, wy, wz = _origin_frame_to_world_arrays(rotation_matrix, local_x, local_y, local_z, origin)
+    else:
+        wx = local_x + origin[0]
+        wy = local_y + origin[1]
+        wz = local_z + origin[2]
+
+    grid = pv.ImageData(
+        dimensions=(nu, nv, nw),
+        spacing=(
+            float(u_coords[1] - u_coords[0]) if len(u_coords) > 1 else 1.0,
+            float(v_coords[1] - v_coords[0]) if len(v_coords) > 1 else 1.0,
+            float(h_coords[1] - h_coords[0]) if len(h_coords) > 1 else 1.0,
+        ),
+        origin=(0.0, -0.5 * radial_thickness, 0.0),
+    )
+
+    ring_cell_size = (angular_cell_size, radial_cell_size, height_cell_size)
+    density = _density_multiplier(
+        wx,
+        wy,
+        wz,
+        density_mode,
+        base_density,
+        density_controls,
+    )
+    if str(density_mode) == "Non-uniform" and str(density_gradient) == GRADIENT_HARMONIC and density_controls:
+        density = _harmonic_interpolated_field(
+            wx,
+            wy,
+            wz,
+            BOUNDARY_BOX,
+            None,
+            0.0,
+            density_controls,
+            max(0.05, float(base_density)),
+            "density",
+            minimum=0.05,
+            grading_resolution=0,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+    px = u + phase[0]
+    py = (v + phase[1]) * density
+    pz = (h + phase[2]) * density
+    offset_field = _offset_field(
+        wx,
+        wy,
+        wz,
+        float(density_offset_value),
+        density_offset_mode,
+        density_offset_controls,
+        density_offset_gradient,
+        BOUNDARY_BOX,
+        None,
+        0.0,
+        grading_resolution,
+        harmonic_boundary_condition,
+    )
+    kx, ky, kz = [2.0 * math.pi / max(ring_cell_size[i], 1e-9) for i in range(3)]
+    field = np.asarray(evaluate_equation(equation, kx * px, ky * py, kz * pz), dtype=float)
+    if field.shape == ():
+        field = np.full(u.shape, float(field))
+    if offset_field.shape != field.shape:
+        offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
+
+    boundary = np.minimum.reduce(
+        (
+            v + 0.5 * radial_thickness,
+            0.5 * radial_thickness - v,
+            h,
+            height - h,
+        )
+    )
+    clip_boundary = _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling)
+    if clip_boundary is not None:
+        boundary = np.minimum(boundary, clip_boundary)
+    grid["surface"] = field.ravel(order="F")
+    grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
+    grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
+    grid["boundary"] = boundary.ravel(order="F")
+
+    if not add_caps:
+        surface = _generate_uncapped_polydata(grid, part, True)
+    elif part == PART_SHEET:
+        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
+            scalars="lower_surface",
+            invert=False,
+        )
+        volume = _apply_boundary_clip(volume, True)
+        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    elif part == PART_UPPER:
+        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
+        volume = _apply_boundary_clip(volume, True)
+        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    elif part == PART_LOWER:
+        volume = grid.clip_scalar(scalars="lower_surface")
+        volume = _apply_boundary_clip(volume, True)
+        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    elif part == PART_SURFACE:
+        surface = grid.contour(isosurfaces=[0.0], scalars="surface").extract_surface().clean().triangulate()
+    else:
+        raise ValueError("Unsupported TPMS part: {}".format(part))
+
+    surface = _remove_periodic_axis_caps(surface, circumference)
+    surface = _stitch_periodic_axis_edges(surface, circumference)
+    return _map_ring_polydata_to_world(surface, radius, circumference, origin, rotation_matrix)
+
+
+def _cylindrical_ring_local_arrays(u, v, h, radius, circumference):
+    theta = 2.0 * math.pi * u / max(float(circumference), 1e-12)
+    radial = float(radius) + v
+    return radial * np.cos(theta), radial * np.sin(theta), h
+
+
+def _origin_frame_to_world_arrays(rotation_matrix, lx, ly, lz, origin):
+    wx = rotation_matrix[0, 0] * lx + rotation_matrix[0, 1] * ly + rotation_matrix[0, 2] * lz + origin[0]
+    wy = rotation_matrix[1, 0] * lx + rotation_matrix[1, 1] * ly + rotation_matrix[1, 2] * lz + origin[1]
+    wz = rotation_matrix[2, 0] * lx + rotation_matrix[2, 1] * ly + rotation_matrix[2, 2] * lz + origin[2]
+    return wx, wy, wz
+
+
+def _remove_periodic_axis_caps(polydata, period):
+    polydata = polydata.triangulate()
+    faces = np.asarray(polydata.faces, dtype=np.int64)
+    if len(faces) == 0:
+        return polydata
+    face_matrix = faces.reshape((-1, 4))
+    triangles = face_matrix[face_matrix[:, 0] == 3, 1:4]
+    points = np.asarray(polydata.points, dtype=float)
+    tolerance = max(float(period) * 1e-8, 1e-8)
+    lower = points[triangles, 0] <= tolerance
+    upper = points[triangles, 0] >= float(period) - tolerance
+    keep = ~(np.all(lower, axis=1) | np.all(upper, axis=1))
+    if np.all(keep):
+        return polydata
+    kept = triangles[keep]
+    if len(kept) == 0:
+        return polydata
+    new_faces = np.empty(len(kept) * 4, dtype=np.int64)
+    new_faces[0::4] = 3
+    new_faces.reshape((-1, 4))[:, 1:4] = kept
+    result = pv.PolyData(points.copy(), new_faces)
+    for name, values in polydata.point_data.items():
+        result.point_data[name] = values
+    return result.clean().triangulate()
+
+
+def _stitch_periodic_axis_edges(polydata, period):
+    polydata = polydata.triangulate()
+    faces = np.asarray(polydata.faces, dtype=np.int64)
+    if len(faces) == 0:
+        return polydata
+    face_matrix = faces.reshape((-1, 4))
+    triangles = face_matrix[face_matrix[:, 0] == 3, 1:4].copy()
+    points = np.asarray(polydata.points, dtype=float)
+    tolerance = max(float(period) * 1e-8, 1e-8)
+    lower_indices = np.flatnonzero(points[:, 0] <= tolerance)
+    upper_indices = np.flatnonzero(points[:, 0] >= float(period) - tolerance)
+    if len(lower_indices) == 0 or len(upper_indices) == 0:
+        return polydata
+
+    key_scale = 1.0 / tolerance
+
+    def seam_key(point):
+        return (int(round(float(point[1]) * key_scale)), int(round(float(point[2]) * key_scale)))
+
+    lower_by_key = {seam_key(points[index]): int(index) for index in lower_indices}
+    replacements = {}
+    for index in upper_indices:
+        lower_index = lower_by_key.get(seam_key(points[index]))
+        if lower_index is not None:
+            replacements[int(index)] = lower_index
+    if not replacements:
+        return polydata
+
+    remapped = triangles.copy()
+    for source, target in replacements.items():
+        remapped[remapped == source] = target
+    keep = (
+        (remapped[:, 0] != remapped[:, 1])
+        & (remapped[:, 1] != remapped[:, 2])
+        & (remapped[:, 2] != remapped[:, 0])
+    )
+    remapped = remapped[keep]
+    if len(remapped) == 0:
+        return polydata
+
+    new_faces = np.empty(len(remapped) * 4, dtype=np.int64)
+    new_faces[0::4] = 3
+    new_faces.reshape((-1, 4))[:, 1:4] = remapped
+    result = pv.PolyData(points.copy(), new_faces)
+    for name, values in polydata.point_data.items():
+        result.point_data[name] = values
+    return result.clean(tolerance=tolerance).triangulate()
+
+
+def _map_ring_polydata_to_world(polydata, radius, circumference, origin, rotation_matrix=None):
+    points = np.asarray(polydata.points, dtype=float)
+    local_x, local_y, local_z = _cylindrical_ring_local_arrays(
+        points[:, 0],
+        points[:, 1],
+        points[:, 2],
+        radius,
+        circumference,
+    )
+    if rotation_matrix is not None:
+        wx, wy, wz = _origin_frame_to_world_arrays(rotation_matrix, local_x, local_y, local_z, origin)
+    else:
+        wx = local_x + origin[0]
+        wy = local_y + origin[1]
+        wz = local_z + origin[2]
+    mapped = polydata.copy(deep=True)
+    mapped.points = np.column_stack((wx, wy, wz))
+    return mapped.clean(tolerance=max(float(radius) * 1e-8, 1e-8)).triangulate()
 
 
 def polydata_to_freecad_mesh(polydata):
@@ -1190,9 +2026,60 @@ def generate_freecad_mesh(
     base_density=1.0,
     density_controls=None,
     density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_value=0.3,
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    coordinate_mode=COORDINATE_CARTESIAN,
+    ring_radius=25.0,
+    ring_outer_radius=35.0,
+    ring_height=10.0,
+    ring_angular_cells=8,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     repeat_cell = tuple(max(1, int(value)) for value in repeat_cell)
     cell_size = tuple(float(value) for value in cell_size)
+
+    if str(coordinate_mode) == COORDINATE_CYLINDRICAL_RING:
+        polydata = generate_cylindrical_ring_polydata(
+            equation,
+            part,
+            cell_size,
+            resolution,
+            offset,
+            phase,
+            add_caps,
+            origin,
+            origin_rotation,
+            ring_radius,
+            ring_outer_radius,
+            ring_height,
+            ring_angular_cells,
+            density_mode,
+            base_density,
+            density_controls,
+            density_count_mode,
+            density_gradient,
+            density_offset_mode,
+            density_offset_value,
+            density_offset_controls,
+            density_offset_gradient,
+            boundary_mode=boundary_mode,
+            boundary_object=boundary_object,
+            sampling=sampling,
+            grading_resolution=grading_resolution,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+        return _prepare_freecad_mesh(
+            polydata,
+            mesh_relaxation,
+            relax_iterations,
+            relax_skip_boundary,
+            relax_cap_surface,
+            add_caps,
+        )
 
     if mesh_stitching:
         polydata = generate_polydata(
@@ -1213,6 +2100,13 @@ def generate_freecad_mesh(
             base_density,
             density_controls,
             density_count_mode,
+            density_gradient,
+            density_offset_mode,
+            density_offset_value,
+            density_offset_controls,
+            density_offset_gradient,
+            grading_resolution,
+            harmonic_boundary_condition,
         )
         return _prepare_freecad_mesh(
             polydata,
@@ -1242,6 +2136,13 @@ def generate_freecad_mesh(
             base_density,
             density_controls,
             density_count_mode,
+            density_gradient,
+            density_offset_mode,
+            density_offset_value,
+            density_offset_controls,
+            density_offset_gradient,
+            grading_resolution,
+            harmonic_boundary_condition,
         )
         mesh = _prepare_freecad_mesh(
             polydata,
@@ -1271,6 +2172,13 @@ def generate_freecad_mesh(
         base_density,
         density_controls,
         density_count_mode,
+        density_gradient,
+        density_offset_mode,
+        density_offset_value,
+        density_offset_controls,
+        density_offset_gradient,
+        grading_resolution,
+        harmonic_boundary_condition,
     )
     unit_mesh = _prepare_freecad_mesh(
         polydata,
@@ -1327,6 +2235,12 @@ def add_tpms_mesh_to_document(
     base_density=1.0,
     density_controls=None,
     density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_value=0.3,
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
     label="TPMS unit cell",
 ):
     if App.ActiveDocument is None:
@@ -1356,6 +2270,12 @@ def add_tpms_mesh_to_document(
         base_density,
         density_controls,
         density_count_mode,
+        density_gradient,
+        density_offset_mode,
+        density_offset_value,
+        density_offset_controls,
+        density_offset_gradient,
+        grading_resolution=grading_resolution,
     )
 
     obj = doc.addObject("Mesh::Feature", "TPMS_Unit_Cell")
@@ -1378,9 +2298,14 @@ def add_tpms_mesh_to_document(
     obj.addProperty("App::PropertyBool", "RelaxCapSurface", "Relaxation", "Allow cap vertices to relax tangentially while keeping seam fixed")
     obj.addProperty("App::PropertyVector", "Origin", "TPMS", "TPMS phase origin")
     obj.addProperty("App::PropertyVector", "OriginRotation", "TPMS", "TPMS origin-frame rotation in XYZ degrees")
-    obj.addProperty("App::PropertyString", "DensityMode", "Density", "Density control mode")
-    obj.addProperty("App::PropertyFloat", "BaseDensity", "Density", "Base TPMS density multiplier")
-    obj.addProperty("App::PropertyString", "DensityCountMode", "Density", "How non-uniform density affects total TPMS cell count")
+    obj.addProperty("App::PropertyString", "DensityMode", "Grading", "Unit-cell density mode")
+    obj.addProperty("App::PropertyFloat", "BaseDensity", "Grading", "Base TPMS unit-cell density multiplier")
+    obj.addProperty("App::PropertyString", "DensityCountMode", "Grading", "How non-uniform unit-cell density affects total TPMS cell count")
+    obj.addProperty("App::PropertyString", "DensityGradient", "Grading", "Unit-cell density source")
+    obj.addProperty("App::PropertyString", "DensityOffsetMode", "Grading", "Thickness grading mode")
+    obj.addProperty("App::PropertyFloat", "DensityOffsetValue", "Grading", "Target thickness for thickness grading")
+    obj.addProperty("App::PropertyString", "DensityOffsetGradient", "Grading", "Thickness grading source")
+    obj.addProperty("App::PropertyInteger", "GradingResolution", "Grading", "Harmonic grading grid cells along the longest axis")
     obj.ImplicitEquation = equation
     obj.TPMSPart = part
     obj.Resolution = int(resolution)
@@ -1399,6 +2324,11 @@ def add_tpms_mesh_to_document(
     obj.DensityMode = str(density_mode)
     obj.BaseDensity = float(base_density)
     obj.DensityCountMode = str(density_count_mode)
+    obj.DensityGradient = str(density_gradient)
+    obj.DensityOffsetMode = str(density_offset_mode)
+    obj.DensityOffsetValue = float(density_offset_value)
+    obj.DensityOffsetGradient = str(density_offset_gradient)
+    obj.GradingResolution = int(grading_resolution)
     if origin is not None:
         obj.Origin = App.Vector(float(origin[0]), float(origin[1]), float(origin[2]))
     if origin_rotation is not None and not hasattr(origin_rotation, "toMatrix"):

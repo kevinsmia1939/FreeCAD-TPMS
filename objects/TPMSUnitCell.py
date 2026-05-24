@@ -34,16 +34,27 @@ def make_tpms_unit_cell(doc=None):
     controller.Offset = 0.3
     controller.CellSize = App.Vector(10.0, 10.0, 10.0)
     controller.Phase = App.Vector(0.0, 0.0, 0.0)
+    controller.CoordinateMode = tpms_generator.COORDINATE_CARTESIAN
+    controller.RingRadius = 25.0
+    controller.RingOuterRadius = 35.0
+    controller.RingHeight = 10.0
+    controller.RingAngularCells = 8
     controller.OriginMode = "Boundary object"
     controller.Origin = App.Vector(0.0, 0.0, 0.0)
     controller.RotationMode = "Same as origin"
     controller.OriginRotation = App.Vector(0.0, 0.0, 0.0)
     controller.DensityMode = "Uniform"
-    controller.DensityGradient = "Selected-face distance field"
+    controller.DensityGradient = tpms_generator.GRADIENT_FACE_DISTANCE
     controller.BaseDensity = 1.0
     controller.DensityCountMode = tpms_generator.DENSITY_COUNT_FOLLOW
     controller.FaceDensity = 1.5
     controller.DensityTransition = 5.0
+    controller.DensityOffsetMode = "Uniform"
+    controller.DensityOffsetGradient = tpms_generator.GRADIENT_FACE_DISTANCE
+    controller.DensityOffsetValue = 0.3
+    controller.DensityOffsetTransition = 5.0
+    controller.GradingResolution = 16
+    controller.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR
     controller.MeshStitching = False
     controller.BoundaryMode = tpms_generator.BOUNDARY_BOX
     controller.Sampling = 0.0
@@ -92,6 +103,24 @@ class TPMSUnitCell:
             obj.addProperty("App::PropertyVector", "CellSize", "TPMS", "Unit-cell size in X/Y/Z")
         if not hasattr(obj, "Phase"):
             obj.addProperty("App::PropertyVector", "Phase", "TPMS", "Phase shift in document units")
+        if not hasattr(obj, "CoordinateMode"):
+            obj.addProperty("App::PropertyEnumeration", "CoordinateMode", "TPMS", "Coordinate system used for TPMS generation")
+            obj.CoordinateMode = tpms_generator.coordinate_modes()
+            obj.CoordinateMode = tpms_generator.COORDINATE_CARTESIAN
+        if not hasattr(obj, "RingRadius"):
+            obj.addProperty("App::PropertyFloat", "RingRadius", "TPMS", "Cylindrical ring inner radius")
+            obj.RingRadius = 25.0
+        if not hasattr(obj, "RingOuterRadius"):
+            obj.addProperty("App::PropertyFloat", "RingOuterRadius", "TPMS", "Cylindrical ring outer radius")
+            obj.RingOuterRadius = float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))
+        if hasattr(obj, "RingRadialThickness"):
+            obj.setEditorMode("RingRadialThickness", 2)
+        if not hasattr(obj, "RingHeight"):
+            obj.addProperty("App::PropertyFloat", "RingHeight", "TPMS", "Cylindrical ring height")
+            obj.RingHeight = 10.0
+        if not hasattr(obj, "RingAngularCells"):
+            obj.addProperty("App::PropertyInteger", "RingAngularCells", "TPMS", "TPMS periods around the cylindrical ring")
+            obj.RingAngularCells = 8
         if not hasattr(obj, "OriginMode"):
             obj.addProperty("App::PropertyEnumeration", "OriginMode", "TPMS", "How to choose the TPMS phase origin")
             obj.OriginMode = ["Boundary object", "Custom XYZ", "Datum point"]
@@ -113,45 +142,77 @@ class TPMSUnitCell:
         if hasattr(obj, "RotateWithBoundary"):
             obj.setEditorMode("RotateWithBoundary", 2)
         if not hasattr(obj, "DensityMode"):
-            obj.addProperty("App::PropertyEnumeration", "DensityMode", "Density", "How TPMS cell density is controlled")
+            obj.addProperty("App::PropertyEnumeration", "DensityMode", "Grading", "How TPMS unit-cell density is controlled")
             obj.DensityMode = ["Uniform", "Non-uniform"]
             obj.DensityMode = "Uniform"
         if not hasattr(obj, "DensityGradient"):
-            obj.addProperty("App::PropertyEnumeration", "DensityGradient", "Density", "Source of the non-uniform density field")
+            obj.addProperty("App::PropertyEnumeration", "DensityGradient", "Grading", "Source of the non-uniform unit-cell density field")
         try:
             current_density_gradient = str(obj.DensityGradient)
-            obj.DensityGradient = ["Selected-face distance field", "Face plane"]
-            obj.DensityGradient = current_density_gradient if current_density_gradient in ("Selected-face distance field", "Face plane") else "Selected-face distance field"
+            gradients = [tpms_generator.GRADIENT_FACE_DISTANCE, tpms_generator.GRADIENT_FACE_PLANE, tpms_generator.GRADIENT_HARMONIC]
+            obj.DensityGradient = gradients
+            obj.DensityGradient = current_density_gradient if current_density_gradient in gradients else tpms_generator.GRADIENT_FACE_DISTANCE
         except Exception:
             pass
         if not hasattr(obj, "BaseDensity"):
-            obj.addProperty("App::PropertyFloat", "BaseDensity", "Density", "Base TPMS density multiplier")
+            obj.addProperty("App::PropertyFloat", "BaseDensity", "Grading", "Base TPMS unit-cell density multiplier")
             obj.BaseDensity = 1.0
         if not hasattr(obj, "DensityCountMode"):
-            obj.addProperty("App::PropertyEnumeration", "DensityCountMode", "Density", "How non-uniform density affects total TPMS cell count")
+            obj.addProperty("App::PropertyEnumeration", "DensityCountMode", "Grading", "How non-uniform unit-cell density affects total TPMS cell count")
             obj.DensityCountMode = [tpms_generator.DENSITY_COUNT_FOLLOW, tpms_generator.DENSITY_COUNT_PRESERVE]
             obj.DensityCountMode = tpms_generator.DENSITY_COUNT_FOLLOW
         if not hasattr(obj, "FaceDensity"):
-            obj.addProperty("App::PropertyFloat", "FaceDensity", "Density", "Default density multiplier for new selected-face controls")
+            obj.addProperty("App::PropertyFloat", "FaceDensity", "Grading", "Default unit-cell density multiplier for new selected-face controls")
             obj.FaceDensity = 1.5
         if not hasattr(obj, "DensityTransition"):
-            obj.addProperty("App::PropertyFloat", "DensityTransition", "Density", "Default transition distance for new selected-face controls")
+            obj.addProperty("App::PropertyFloat", "DensityTransition", "Grading", "Default transition distance for new selected-face controls")
             obj.DensityTransition = 5.0
         if not hasattr(obj, "FaceControls"):
-            obj.addProperty("App::PropertyLinkList", "FaceControls", "Density", "Selected-face TPMS density controls")
+            obj.addProperty("App::PropertyLinkList", "FaceControls", "Grading", "Selected-face TPMS unit-cell density controls")
+        if not hasattr(obj, "DensityOffsetMode"):
+            obj.addProperty("App::PropertyEnumeration", "DensityOffsetMode", "Grading", "How sheet/skeletal thickness is graded")
+            obj.DensityOffsetMode = ["Uniform", "Non-uniform"]
+            obj.DensityOffsetMode = "Uniform"
+        if not hasattr(obj, "DensityOffsetGradient"):
+            obj.addProperty("App::PropertyEnumeration", "DensityOffsetGradient", "Grading", "Source of the non-uniform thickness field")
+            obj.DensityOffsetGradient = [tpms_generator.GRADIENT_FACE_DISTANCE, tpms_generator.GRADIENT_FACE_PLANE, tpms_generator.GRADIENT_HARMONIC]
+            obj.DensityOffsetGradient = tpms_generator.GRADIENT_FACE_DISTANCE
+        else:
+            try:
+                current_offset_gradient = str(obj.DensityOffsetGradient)
+                gradients = [tpms_generator.GRADIENT_FACE_DISTANCE, tpms_generator.GRADIENT_FACE_PLANE, tpms_generator.GRADIENT_HARMONIC]
+                obj.DensityOffsetGradient = gradients
+                obj.DensityOffsetGradient = current_offset_gradient if current_offset_gradient in gradients else tpms_generator.GRADIENT_FACE_DISTANCE
+            except Exception:
+                pass
+        if not hasattr(obj, "DensityOffsetValue"):
+            obj.addProperty("App::PropertyFloat", "DensityOffsetValue", "Grading", "Target thickness near selected faces")
+            obj.DensityOffsetValue = 0.3
+        if not hasattr(obj, "DensityOffsetTransition"):
+            obj.addProperty("App::PropertyFloat", "DensityOffsetTransition", "Grading", "Default transition distance for thickness controls")
+            obj.DensityOffsetTransition = 5.0
+        if not hasattr(obj, "DensityOffsetControls"):
+            obj.addProperty("App::PropertyLinkList", "DensityOffsetControls", "Grading", "Selected-face TPMS thickness controls")
+        if not hasattr(obj, "GradingResolution"):
+            obj.addProperty("App::PropertyInteger", "GradingResolution", "Grading", "Grid cells along the longest axis for harmonic grading; 0 uses TPMS resolution")
+            obj.GradingResolution = 16
+        if not hasattr(obj, "HarmonicBoundaryCondition"):
+            obj.addProperty("App::PropertyEnumeration", "HarmonicBoundaryCondition", "Grading", "How unselected boundary faces behave in harmonic grading")
+            obj.HarmonicBoundaryCondition = [tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR, tpms_generator.HARMONIC_BOUNDARY_INSULATOR]
+            obj.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR
         if not hasattr(obj, "MeshStitching"):
             obj.addProperty("App::PropertyBool", "MeshStitching", "TPMS Array", "Stitch repeated mesh boundaries")
             obj.MeshStitching = False
         if not hasattr(obj, "BoundaryMode"):
-            obj.addProperty("App::PropertyEnumeration", "BoundaryMode", "Boundary", "Boundary used to clip the generated TPMS")
+            obj.addProperty("App::PropertyEnumeration", "BoundaryMode", "TPMS", "Boundary used to clip the generated TPMS")
             obj.BoundaryMode = tpms_generator.boundary_modes()
         if not hasattr(obj, "BoundaryObject"):
-            obj.addProperty("App::PropertyXLink", "BoundaryObject", "Boundary", "Selected solid or mesh used as boundary")
+            obj.addProperty("App::PropertyXLink", "BoundaryObject", "TPMS", "Selected solid or mesh used as boundary")
         if not hasattr(obj, "Sampling"):
-            obj.addProperty("App::PropertyFloat", "Sampling", "Boundary", "Target grid resolution along the longest sampled axis; 0 uses Resolution")
+            obj.addProperty("App::PropertyFloat", "Sampling", "TPMS", "Target grid resolution along the longest sampled axis; 0 uses Resolution")
             obj.Sampling = 0.0
         if not hasattr(obj, "AddCaps"):
-            obj.addProperty("App::PropertyBool", "AddCaps", "Boundary", "Add caps where TPMS intersects the boundary")
+            obj.addProperty("App::PropertyBool", "AddCaps", "TPMS", "Add caps where TPMS intersects the boundary")
             obj.AddCaps = True
         if not hasattr(obj, "MeshRelaxation"):
             obj.addProperty("App::PropertyBool", "MeshRelaxation", "Relaxation", "Apply Lloyd-style mesh relaxation")
@@ -211,7 +272,8 @@ class TPMSUnitCell:
             phase = _vector_tuple(obj.Phase, fallback=(0.0, 0.0, 0.0), minimum=None)
             origin = _origin_tuple(obj)
             origin_rotation = _origin_rotation(obj)
-            density_controls = _density_controls(obj)
+            unit_cell_controls = _unit_cell_controls(obj)
+            density_offset_controls = _density_offset_controls(obj)
             mesh = tpms_generator.generate_freecad_mesh(
                 obj.Equation,
                 str(obj.Part),
@@ -233,8 +295,20 @@ class TPMSUnitCell:
                 origin_rotation,
                 str(getattr(obj, "DensityMode", "Uniform")),
                 max(0.05, float(getattr(obj, "BaseDensity", 1.0))),
-                density_controls,
+                unit_cell_controls,
                 str(getattr(obj, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW)),
+                str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                str(getattr(obj, "DensityOffsetMode", "Uniform")),
+                float(getattr(obj, "Offset", 0.3)),
+                density_offset_controls,
+                str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                str(getattr(obj, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
+                max(1e-9, float(getattr(obj, "RingRadius", 25.0))),
+                max(1e-9, float(getattr(obj, "RingOuterRadius", float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))))),
+                max(1e-9, float(getattr(obj, "RingHeight", 10.0))),
+                max(1, int(getattr(obj, "RingAngularCells", 8))),
+                max(0, int(getattr(obj, "GradingResolution", 16))),
+                str(getattr(obj, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
             )
         except Exception as exc:
             obj.LastError = str(exc)
@@ -296,21 +370,25 @@ class TPMSFaceDensityControl:
 
     def _add_properties(self, obj):
         if not hasattr(obj, "Enabled"):
-            obj.addProperty("App::PropertyBool", "Enabled", "Density", "Use this face density control")
+            obj.addProperty("App::PropertyBool", "Enabled", "Unit cell density", "Use this face unit-cell density control")
             obj.Enabled = True
         if not hasattr(obj, "SourceObject"):
-            obj.addProperty("App::PropertyXLink", "SourceObject", "Density", "Solid object containing the selected face")
+            obj.addProperty("App::PropertyXLink", "SourceObject", "Unit cell density", "Solid object containing the selected face")
         if not hasattr(obj, "FaceNames"):
-            obj.addProperty("App::PropertyStringList", "FaceNames", "Density", "Selected subelement face names")
+            obj.addProperty("App::PropertyStringList", "FaceNames", "Unit cell density", "Selected subelement face names")
         if not hasattr(obj, "DensityFactor"):
-            obj.addProperty("App::PropertyFloat", "DensityFactor", "Density", "Target density multiplier near the selected face")
+            obj.addProperty("App::PropertyFloat", "DensityFactor", "Unit cell density", "Target unit-cell density multiplier near the selected face")
             obj.DensityFactor = 1.5
         if not hasattr(obj, "Transition"):
-            obj.addProperty("App::PropertyFloat", "Transition", "Density", "Transition distance away from the selected face")
+            obj.addProperty("App::PropertyFloat", "Transition", "Unit cell density", "Transition distance away from the selected face")
             obj.Transition = 5.0
 
     def onDocumentRestored(self, obj):
         self._add_properties(obj)
+
+    def onChanged(self, obj, prop):
+        if prop in ("Enabled", "SourceObject", "FaceNames", "DensityFactor", "Transition"):
+            _touch_linked_tpms_controllers(obj)
 
     def execute(self, obj):
         _set_controller_shape(obj)
@@ -346,8 +424,8 @@ class TPMSFaceDensityControlViewProvider:
 
 def add_face_density_control(controller, source_object, face_names, density=None, transition=None):
     doc = controller.Document
-    control = doc.addObject("Part::FeaturePython", "TPMS_Face_Density")
-    control.Label = "TPMS Face Density {}".format(",".join(face_names))
+    control = doc.addObject("Part::FeaturePython", "TPMS_Unit_Cell_Density")
+    control.Label = "TPMS Unit Cell Density {}".format(",".join(face_names))
     TPMSFaceDensityControl(control)
     _set_controller_shape(control)
     if getattr(control, "ViewObject", None) is not None:
@@ -366,6 +444,241 @@ def add_face_density_control(controller, source_object, face_names, density=None
     controls = list(getattr(controller, "FaceControls", []))
     controls.append(control)
     controller.FaceControls = controls
+    return control
+
+
+class TPMSOffsetDensityControl:
+    Type = "TPMS::OffsetDensityControl"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        self._add_properties(obj)
+
+    def _add_properties(self, obj):
+        if not hasattr(obj, "Enabled"):
+            obj.addProperty("App::PropertyBool", "Enabled", "Sheet/skeletal thickness", "Use this thickness control")
+            obj.Enabled = True
+        if not hasattr(obj, "SourceObject"):
+            obj.addProperty("App::PropertyXLink", "SourceObject", "Sheet/skeletal thickness", "Solid object containing the selected face")
+        if not hasattr(obj, "FaceNames"):
+            obj.addProperty("App::PropertyStringList", "FaceNames", "Sheet/skeletal thickness", "Selected subelement face names")
+        if not hasattr(obj, "OffsetValue"):
+            obj.addProperty("App::PropertyFloat", "OffsetValue", "Sheet/skeletal thickness", "Target thickness near the selected face")
+            obj.OffsetValue = 0.3
+        if not hasattr(obj, "Transition"):
+            obj.addProperty("App::PropertyFloat", "Transition", "Sheet/skeletal thickness", "Transition distance away from the selected face")
+            obj.Transition = 5.0
+
+    def onDocumentRestored(self, obj):
+        self._add_properties(obj)
+
+    def onChanged(self, obj, prop):
+        if prop in ("Enabled", "SourceObject", "FaceNames", "OffsetValue", "Transition"):
+            _touch_linked_tpms_controllers(obj)
+
+    def execute(self, obj):
+        _set_controller_shape(obj)
+
+    def dumps(self):
+        return None
+
+    def loads(self, state):
+        return None
+
+
+class TPMSOffsetDensityControlViewProvider:
+    def __init__(self, view_obj):
+        view_obj.Proxy = self
+        _configure_controller_view(view_obj)
+
+    def getIcon(self):
+        import os
+        import GyroidAssemblerUtils
+
+        return os.path.join(GyroidAssemblerUtils.MOD_PATH, "icons", "TPMSAssembler.svg")
+
+    def attach(self, view_obj):
+        self.Object = view_obj.Object
+        _configure_controller_view(view_obj)
+
+    def dumps(self):
+        return None
+
+    def loads(self, state):
+        return None
+
+
+def add_offset_density_control(controller, source_object, face_names, offset_value=None, transition=None):
+    doc = controller.Document
+    control = doc.addObject("Part::FeaturePython", "TPMS_Thickness")
+    control.Label = "TPMS Thickness {}".format(",".join(face_names))
+    TPMSOffsetDensityControl(control)
+    _set_controller_shape(control)
+    if getattr(control, "ViewObject", None) is not None:
+        TPMSOffsetDensityControlViewProvider(control.ViewObject)
+        _configure_controller_view(control.ViewObject)
+
+    control.SourceObject = source_object
+    control.FaceNames = list(face_names)
+    control.OffsetValue = float(offset_value if offset_value is not None else getattr(controller, "DensityOffsetValue", 0.3))
+    control.Transition = float(transition if transition is not None else getattr(controller, "DensityOffsetTransition", 5.0))
+
+    parent = _container_for(controller)
+    if parent is not None:
+        parent.addObject(control)
+
+    controls = list(getattr(controller, "DensityOffsetControls", []))
+    controls.append(control)
+    controller.DensityOffsetControls = controls
+    return control
+
+
+class TPMSGradingControl:
+    Type = "TPMS::GradingControl"
+
+    def __init__(self, obj):
+        obj.Proxy = self
+        self._add_properties(obj)
+
+    def _add_properties(self, obj):
+        if not hasattr(obj, "Enabled"):
+            obj.addProperty("App::PropertyBool", "Enabled", "Grading", "Use this grading control")
+            obj.Enabled = True
+        if not hasattr(obj, "SourceObject"):
+            obj.addProperty("App::PropertyXLink", "SourceObject", "Grading", "Solid object containing the selected face")
+        if not hasattr(obj, "FaceNames"):
+            obj.addProperty("App::PropertyStringList", "FaceNames", "Grading", "Selected subelement face names")
+        if not hasattr(obj, "UseUnitCellDensity"):
+            obj.addProperty("App::PropertyBool", "UseUnitCellDensity", "Unit cell density", "Use this control for unit-cell density")
+            obj.UseUnitCellDensity = True
+        if not hasattr(obj, "DensityFactor"):
+            obj.addProperty("App::PropertyFloat", "DensityFactor", "Unit cell density", "Target unit-cell density multiplier near the selected face")
+            obj.DensityFactor = 1.5
+        if not hasattr(obj, "UnitCellTransition"):
+            obj.addProperty("App::PropertyFloat", "UnitCellTransition", "Unit cell density", "Transition distance away from the selected face")
+            obj.UnitCellTransition = 5.0
+        if not hasattr(obj, "UseThickness"):
+            obj.addProperty("App::PropertyBool", "UseThickness", "Sheet/skeletal thickness", "Use this control for sheet/skeletal thickness")
+            obj.UseThickness = True
+        if not hasattr(obj, "OffsetValue"):
+            obj.addProperty("App::PropertyFloat", "OffsetValue", "Sheet/skeletal thickness", "Target thickness near the selected face")
+            obj.OffsetValue = 0.3
+        if not hasattr(obj, "ThicknessTransition"):
+            obj.addProperty("App::PropertyFloat", "ThicknessTransition", "Sheet/skeletal thickness", "Transition distance away from the selected face")
+            obj.ThicknessTransition = 5.0
+
+    def onDocumentRestored(self, obj):
+        self._add_properties(obj)
+
+    def onChanged(self, obj, prop):
+        if prop in (
+            "Enabled",
+            "SourceObject",
+            "FaceNames",
+            "UseUnitCellDensity",
+            "DensityFactor",
+            "UnitCellTransition",
+            "UseThickness",
+            "OffsetValue",
+            "ThicknessTransition",
+        ):
+            _sync_controller_grading_modes(obj, prop)
+            _touch_linked_tpms_controllers(obj)
+
+    def execute(self, obj):
+        _set_controller_shape(obj)
+
+    def dumps(self):
+        return None
+
+    def loads(self, state):
+        return None
+
+
+class TPMSGradingControlViewProvider:
+    def __init__(self, view_obj):
+        view_obj.Proxy = self
+        _configure_controller_view(view_obj)
+
+    def getIcon(self):
+        import os
+        import GyroidAssemblerUtils
+
+        return os.path.join(GyroidAssemblerUtils.MOD_PATH, "icons", "TPMSAssembler.svg")
+
+    def attach(self, view_obj):
+        self.Object = view_obj.Object
+        _configure_controller_view(view_obj)
+
+    def doubleClicked(self, view_obj):
+        try:
+            import FreeCADGui as Gui
+            from ui.task_grading import TPMSGradingTaskPanel
+
+            Gui.Control.showDialog(TPMSGradingTaskPanel(view_obj.Object))
+            return True
+        except Exception as exc:
+            App.Console.PrintError("Unable to open TPMS grading task panel: {}\n".format(exc))
+            return False
+
+    def dumps(self):
+        return None
+
+    def loads(self, state):
+        return None
+
+
+def add_grading_control(
+    controller,
+    source_object,
+    face_names,
+    unit_cell_density=None,
+    unit_cell_transition=None,
+    thickness=None,
+    thickness_transition=None,
+    use_unit_cell_density=True,
+    use_thickness=True,
+):
+    doc = controller.Document
+    control = doc.addObject("Part::FeaturePython", "TPMS_Grading")
+    control.Label = "TPMS Grading {}".format(",".join(face_names))
+    TPMSGradingControl(control)
+    _set_controller_shape(control)
+    if getattr(control, "ViewObject", None) is not None:
+        TPMSGradingControlViewProvider(control.ViewObject)
+        _configure_controller_view(control.ViewObject)
+
+    control.SourceObject = source_object
+    control.FaceNames = list(face_names)
+    control.UseUnitCellDensity = bool(use_unit_cell_density)
+    control.DensityFactor = float(unit_cell_density if unit_cell_density is not None else getattr(controller, "FaceDensity", 1.5))
+    control.UnitCellTransition = float(unit_cell_transition if unit_cell_transition is not None else getattr(controller, "DensityTransition", 5.0))
+    control.UseThickness = bool(use_thickness)
+    control.OffsetValue = float(thickness if thickness is not None else getattr(controller, "DensityOffsetValue", 0.3))
+    control.ThicknessTransition = float(thickness_transition if thickness_transition is not None else getattr(controller, "DensityOffsetTransition", 5.0))
+
+    parent = _container_for(controller)
+    if parent is not None:
+        parent.addObject(control)
+
+    controls = list(getattr(controller, "FaceControls", []))
+    if control not in controls:
+        controls.append(control)
+        controller.FaceControls = controls
+
+    controls = list(getattr(controller, "DensityOffsetControls", []))
+    if control not in controls:
+        controls.append(control)
+        controller.DensityOffsetControls = controls
+
+    if control.UseUnitCellDensity:
+        controller.DensityMode = "Non-uniform"
+    if control.UseThickness:
+        controller.DensityOffsetMode = "Non-uniform"
+    try:
+        controller.touch()
+    except Exception:
+        pass
     return control
 
 
@@ -419,13 +732,17 @@ def _origin_rotation(obj):
     return None
 
 
-def _density_controls(obj):
+def _unit_cell_controls(obj):
     if str(getattr(obj, "DensityMode", "Uniform")) != "Non-uniform":
         return []
-    gradient = str(getattr(obj, "DensityGradient", "Selected-face distance field"))
+    import tpms_generator
+
+    gradient = str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE))
     controls = []
     for control in getattr(obj, "FaceControls", []):
         if control is None or not bool(getattr(control, "Enabled", True)):
+            continue
+        if hasattr(control, "UseUnitCellDensity") and not bool(getattr(control, "UseUnitCellDensity", True)):
             continue
         source = getattr(control, "SourceObject", None)
         shape = getattr(source, "Shape", None)
@@ -435,7 +752,7 @@ def _density_controls(obj):
             try:
                 face = shape.getElement(str(face_name))
                 point, normal = _face_point_normal(face)
-                surface = _face_surface_mesh(face) if gradient == "Selected-face distance field" else None
+                surface = _face_surface_mesh(face) if gradient in (tpms_generator.GRADIENT_FACE_DISTANCE, tpms_generator.GRADIENT_HARMONIC) else None
             except Exception as exc:
                 App.Console.PrintWarning(
                     "Ignoring TPMS density control {} {}: {}\n".format(
@@ -451,7 +768,50 @@ def _density_controls(obj):
                     "point": point,
                     "normal": normal,
                     "density": max(0.05, float(getattr(control, "DensityFactor", 1.0))),
-                    "transition": max(1e-9, float(getattr(control, "Transition", 1.0))),
+                    "transition": max(1e-9, float(getattr(control, "UnitCellTransition", getattr(control, "Transition", 1.0)))),
+                    "surface": surface,
+                }
+            )
+    return controls
+
+
+def _density_offset_controls(obj):
+    if str(getattr(obj, "DensityOffsetMode", "Uniform")) != "Non-uniform":
+        return []
+    import tpms_generator
+
+    gradient = str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE))
+    controls = []
+    for control in getattr(obj, "DensityOffsetControls", []):
+        if control is None or not bool(getattr(control, "Enabled", True)):
+            continue
+        if hasattr(control, "UseThickness") and not bool(getattr(control, "UseThickness", True)):
+            continue
+        source = getattr(control, "SourceObject", None)
+        shape = getattr(source, "Shape", None)
+        if shape is None or shape.isNull():
+            continue
+        for face_name in getattr(control, "FaceNames", []):
+            try:
+                face = shape.getElement(str(face_name))
+                point, normal = _face_point_normal(face)
+                surface = _face_surface_mesh(face) if gradient in (tpms_generator.GRADIENT_FACE_DISTANCE, tpms_generator.GRADIENT_HARMONIC) else None
+            except Exception as exc:
+                App.Console.PrintWarning(
+                    "Ignoring TPMS thickness control {} {}: {}\n".format(
+                        getattr(source, "Label", getattr(source, "Name", "Object")),
+                        face_name,
+                        exc,
+                    )
+                )
+                continue
+            controls.append(
+                {
+                    "type": "face_distance" if surface is not None else "face_plane",
+                    "point": point,
+                    "normal": normal,
+                    "offset": float(getattr(control, "OffsetValue", getattr(obj, "Offset", 0.3))),
+                    "transition": max(1e-9, float(getattr(control, "ThicknessTransition", getattr(control, "Transition", 1.0)))),
                     "surface": surface,
                 }
             )
@@ -492,6 +852,65 @@ def _container_for(obj):
         if hasattr(parent, "addObject") and hasattr(parent, "Group"):
             return parent
     return None
+
+
+def _linked_tpms_controllers(control):
+    doc = getattr(control, "Document", None)
+    if doc is None:
+        return []
+    controllers = []
+    control_container = _container_for(control)
+    for obj in getattr(doc, "Objects", []):
+        if not is_tpms_unit_cell(obj):
+            continue
+        if control_container is not None and _container_for(obj) == control_container:
+            controllers.append(obj)
+            continue
+        for prop in ("FaceControls", "DensityOffsetControls"):
+            try:
+                if control in list(getattr(obj, prop, [])):
+                    controllers.append(obj)
+                    break
+            except Exception:
+                continue
+    return controllers
+
+
+def _touch_linked_tpms_controllers(control):
+    for controller in _linked_tpms_controllers(control):
+        try:
+            controller.touch()
+        except Exception:
+            pass
+        mesh = getattr(controller, "ResultMesh", None)
+        if mesh is not None:
+            try:
+                mesh.touch()
+            except Exception:
+                pass
+
+
+def _sync_controller_grading_modes(control, prop):
+    if prop == "UseUnitCellDensity" and not bool(getattr(control, "UseUnitCellDensity", False)):
+        return
+    if prop == "UseThickness" and not bool(getattr(control, "UseThickness", False)):
+        return
+    for controller in _linked_tpms_controllers(control):
+        try:
+            if hasattr(control, "UseUnitCellDensity") and bool(getattr(control, "UseUnitCellDensity", False)):
+                controls = list(getattr(controller, "FaceControls", []))
+                if control not in controls:
+                    controls.append(control)
+                    controller.FaceControls = controls
+                controller.DensityMode = "Non-uniform"
+            if hasattr(control, "UseThickness") and bool(getattr(control, "UseThickness", False)):
+                controls = list(getattr(controller, "DensityOffsetControls", []))
+                if control not in controls:
+                    controls.append(control)
+                    controller.DensityOffsetControls = controls
+                controller.DensityOffsetMode = "Non-uniform"
+        except Exception:
+            pass
 
 
 def _configure_controller_view(view_obj):
