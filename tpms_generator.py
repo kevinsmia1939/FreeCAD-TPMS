@@ -19,6 +19,8 @@ SURFACE_EQUATIONS = {
     "Lidinoid": "0.5 * (sin(2*x) * cos(y) * sin(z) + sin(2*y) * cos(z) * sin(x) + sin(2*z) * cos(x) * sin(y)) - 0.5 * (cos(2*x) * cos(2*y) + cos(2*y) * cos(2*z) + cos(2*z) * cos(2*x)) + 0.3",
 }
 
+SURFACE_EMPTY = "Empty"
+SURFACE_SOLID_FILL = "Solid fill"
 
 PART_SHEET = "Sheet"
 PART_UPPER = "Upper skeletal"
@@ -69,7 +71,7 @@ SAFE_NAMES = {
 
 
 def surface_names():
-    return list(SURFACE_EQUATIONS)
+    return list(SURFACE_EQUATIONS) + [SURFACE_EMPTY, SURFACE_SOLID_FILL]
 
 
 def evaluate_equation(equation, x, y, z):
@@ -344,6 +346,17 @@ def _density_multiplier(wx, wy, wz, density_mode="Uniform", base_density=1.0, de
     return np.maximum(density, 0.05)
 
 
+def _normalize_density_to_base(density, base_density):
+    density = np.asarray(density, dtype=float)
+    finite = np.isfinite(density)
+    if not np.any(finite):
+        return density
+    mean_density = float(np.mean(density[finite]))
+    if mean_density <= 1e-12:
+        return density
+    return np.maximum(density * (float(base_density) / mean_density), 0.05)
+
+
 def _offset_field(
     wx,
     wy,
@@ -414,6 +427,69 @@ def _apply_face_distance_offset_field(offset, wx, wy, wz, control, base_offset):
     return offset + weight * (target - base_offset)
 
 
+def _apply_offset_controls_to_field(
+    offset,
+    wx,
+    wy,
+    wz,
+    density_offset_mode,
+    density_offset_controls,
+    density_offset_gradient,
+    boundary_mode=BOUNDARY_BOX,
+    boundary_object=None,
+    sampling=0.0,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+):
+    offset = np.asarray(offset, dtype=float)
+    if str(density_offset_mode) != "Non-uniform" or not density_offset_controls:
+        return offset
+
+    gradient = str(density_offset_gradient)
+    if gradient == GRADIENT_HARMONIC:
+        finite = np.isfinite(offset)
+        base_value = float(np.mean(offset[finite])) if np.any(finite) else 0.0
+        return _harmonic_interpolated_field(
+            wx,
+            wy,
+            wz,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            density_offset_controls,
+            base_value,
+            "offset",
+            minimum=None,
+            grading_resolution=grading_resolution,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+
+    result = np.array(offset, dtype=float, copy=True)
+    for control in density_offset_controls:
+        try:
+            target = float(control.get("offset", 0.0))
+            if control.get("type", "face_plane") == "face_distance":
+                distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            else:
+                point = np.asarray(control["point"], dtype=float)
+                normal = np.asarray(control["normal"], dtype=float)
+                norm = float(np.linalg.norm(normal))
+                if norm <= 1e-12:
+                    continue
+                normal = normal / norm
+                distance = np.abs(
+                    (wx - point[0]) * normal[0]
+                    + (wy - point[1]) * normal[1]
+                    + (wz - point[2]) * normal[2]
+                )
+            transition = max(1e-9, float(control.get("transition", 1.0)))
+            weight = _smooth_falloff_weight(distance, transition)
+            result = result + weight * (target - result)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring TPMS hybrid thickness grading control: {}\n".format(exc))
+    return result
+
+
 def _density_phase_coordinates(
     tx,
     ty,
@@ -456,6 +532,8 @@ def _density_phase_coordinates(
             grading_resolution=grading_resolution,
             harmonic_boundary_condition=harmonic_boundary_condition,
         )
+        if str(density_count_mode) == DENSITY_COUNT_PRESERVE:
+            density = _normalize_density_to_base(density, base)
         return (tx + phase[0]) * density, (ty + phase[1]) * density, (tz + phase[2]) * density
 
     if str(density_count_mode) == DENSITY_COUNT_PRESERVE:
@@ -1647,6 +1725,15 @@ def generate_hybrid_polydata(
     region_specs=None,
     transition_controls=None,
     transition_region_specs=None,
+    density_mode="Uniform",
+    density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     configure_vtk_smp()
     region_specs = list(region_specs or [])
@@ -1662,25 +1749,27 @@ def generate_hybrid_polydata(
         sampling,
         origin,
         origin_rotation,
-        "Uniform",
+        density_mode,
         base_density,
-        None,
-        DENSITY_COUNT_FOLLOW,
-        GRADIENT_FACE_DISTANCE,
+        density_controls,
+        density_count_mode,
+        density_gradient,
         "Uniform",
         offset,
         None,
         GRADIENT_FACE_DISTANCE,
-        0,
-        HARMONIC_BOUNDARY_CONDUCTOR,
+        grading_resolution,
+        harmonic_boundary_condition,
     )
 
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
         field = np.full(x.shape, float(field))
     offset_field = np.full(field.shape, float(offset), dtype=float)
+    material_field = np.full(field.shape, -1.0, dtype=float)
     region_index = np.full(field.shape, -1, dtype=np.int32)
     base_density = max(0.05, float(base_density))
+    fill_value = max(1.0, abs(float(offset)))
 
     fallback_resolution = max(wx.shape)
     def boundary_mask(boundary):
@@ -1697,12 +1786,41 @@ def generate_hybrid_polydata(
             return np.where(mask, 0.0, np.inf)
 
     def evaluated_field(spec, equation_key="equation", density_key="base_density"):
+        surface_key = equation_key.replace("equation", "surface")
+        surface_mode = str(spec.get(surface_key, spec.get("surface", "")))
+        if surface_mode in (SURFACE_EMPTY, SURFACE_SOLID_FILL):
+            return np.zeros(field.shape, dtype=float)
         density = max(0.05, float(spec.get(density_key, base_density)))
         scale = density / base_density
-        values = np.asarray(evaluate_equation(str(spec.get(equation_key, equation)), x * scale, y * scale, z * scale), dtype=float)
+        equation_text = str(spec.get(equation_key, equation)).strip()
+        if not equation_text:
+            equation_text = equation
+        values = np.asarray(evaluate_equation(equation_text, x * scale, y * scale, z * scale), dtype=float)
         if values.shape == ():
             values = np.full(field.shape, float(values))
         return values
+
+    def material_from_field(values, offset_values, part_name, surface_mode=""):
+        surface_mode = str(surface_mode)
+        if surface_mode == SURFACE_EMPTY:
+            return np.full(field.shape, -fill_value, dtype=float)
+        if surface_mode == SURFACE_SOLID_FILL:
+            return np.full(field.shape, fill_value, dtype=float)
+        offset_values = np.asarray(offset_values, dtype=float)
+        half_offset = 0.5 * offset_values
+        if str(part_name) == PART_UPPER:
+            return values - half_offset
+        if str(part_name) == PART_LOWER:
+            return -values - half_offset
+        if str(part_name) == PART_SURFACE:
+            return -np.abs(values)
+        return np.minimum(half_offset - values, values + half_offset)
+
+    def material_for_spec(spec, equation_key="equation", density_key="base_density", offset_key="offset", part_key="part", surface_key="surface"):
+        surface_mode = str(spec.get(surface_key, spec.get("surface", "")))
+        offset_value = float(spec.get(offset_key, offset))
+        values = evaluated_field(spec, equation_key, density_key)
+        return material_from_field(values, offset_value, str(spec.get(part_key, part)), surface_mode)
 
     for spec in region_specs:
         boundary = spec.get("boundary_object")
@@ -1715,6 +1833,9 @@ def generate_hybrid_polydata(
         if spec_field.shape == field.shape:
             field[mask] = spec_field[mask]
         offset_field[mask] = float(spec.get("offset", offset))
+        spec_material = material_for_spec(spec)
+        if spec_material.shape == material_field.shape:
+            material_field[mask] = spec_material[mask]
         region_index[mask] = int(spec.get("index", -1))
 
     for spec in transition_region_specs:
@@ -1730,6 +1851,24 @@ def generate_hybrid_polydata(
         target_field = evaluated_field(spec, "target_equation", "target_base_density")
         if source_field.shape != field.shape or target_field.shape != field.shape:
             continue
+        source_material = material_for_spec(
+            spec,
+            "source_equation",
+            "source_base_density",
+            "source_offset",
+            "source_part",
+            "source_surface",
+        )
+        target_material = material_for_spec(
+            spec,
+            "target_equation",
+            "target_base_density",
+            "target_offset",
+            "target_part",
+            "target_surface",
+        )
+        if source_material.shape != material_field.shape or target_material.shape != material_field.shape:
+            continue
         source_distance = boundary_distance(source_boundary)
         target_distance = boundary_distance(target_boundary)
         denom = source_distance + target_distance
@@ -1744,6 +1883,7 @@ def generate_hybrid_polydata(
         source_offset = float(spec.get("source_offset", offset))
         target_offset = float(spec.get("target_offset", offset))
         offset_field[mask] = ((1.0 - t) * source_offset + t * target_offset)[mask]
+        material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
         region_index[mask] = int(spec.get("index", -1))
 
     for control in transition_controls:
@@ -1773,33 +1913,84 @@ def generate_hybrid_polydata(
         except Exception as exc:
             App.Console.PrintWarning("Ignoring hybrid TPMS transition control: {}\n".format(exc))
 
+    offset_field = _apply_offset_controls_to_field(
+        offset_field,
+        wx,
+        wy,
+        wz,
+        density_offset_mode,
+        density_offset_controls,
+        density_offset_gradient,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        grading_resolution,
+        harmonic_boundary_condition,
+    )
+    material_field = np.full(field.shape, -1.0, dtype=float)
+    for spec in region_specs:
+        boundary = spec.get("boundary_object")
+        if boundary is None:
+            continue
+        mask = boundary_mask(boundary)
+        if not np.any(mask):
+            continue
+        spec_field = evaluated_field(spec)
+        spec_material = material_from_field(
+            spec_field,
+            offset_field,
+            str(spec.get("part", part)),
+            str(spec.get("surface", "")),
+        )
+        material_field[mask] = spec_material[mask]
+    for spec in transition_region_specs:
+        boundary = spec.get("boundary_object")
+        source_boundary = spec.get("source_boundary_object")
+        target_boundary = spec.get("target_boundary_object")
+        if boundary is None or source_boundary is None or target_boundary is None:
+            continue
+        mask = boundary_mask(boundary)
+        if not np.any(mask):
+            continue
+        source_field = evaluated_field(spec, "source_equation", "source_base_density")
+        target_field = evaluated_field(spec, "target_equation", "target_base_density")
+        source_material = material_from_field(
+            source_field,
+            offset_field,
+            str(spec.get("source_part", part)),
+            str(spec.get("source_surface", "")),
+        )
+        target_material = material_from_field(
+            target_field,
+            offset_field,
+            str(spec.get("target_part", part)),
+            str(spec.get("target_surface", "")),
+        )
+        source_distance = boundary_distance(source_boundary)
+        target_distance = boundary_distance(target_boundary)
+        denom = source_distance + target_distance
+        t = np.divide(
+            source_distance,
+            denom,
+            out=np.full(field.shape, 0.5, dtype=float),
+            where=np.isfinite(denom) & (denom > 1e-12),
+        )
+        t = _smoothstep(np.clip(t, 0.0, 1.0))
+        material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
+
     grid["surface"] = field.ravel(order="F")
     grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
     grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
+    grid["material"] = material_field.ravel(order="F")
     has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
 
     if not add_caps:
-        return _generate_uncapped_polydata(grid, part, has_boundary)
-    if part == PART_SHEET:
-        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
-            scalars="lower_surface",
-            invert=False,
-        )
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    if part == PART_UPPER:
-        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    if part == PART_LOWER:
-        volume = grid.clip_scalar(scalars="lower_surface")
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    if part == PART_SURFACE:
-        volume = grid.contour(isosurfaces=[0.0], scalars="surface")
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface().clean().triangulate()
-    raise ValueError("Unsupported TPMS part: {}".format(part))
+        surface = grid.contour(isosurfaces=[0.0], scalars="material")
+        surface = _apply_boundary_clip(surface, has_boundary)
+        return surface.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    volume = grid.clip_scalar(scalars="material", value=0.0, invert=False)
+    volume = _apply_boundary_clip(volume, has_boundary)
+    return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
 
 
 def generate_cylindrical_ring_polydata(
@@ -2525,6 +2716,15 @@ def generate_hybrid_freecad_mesh(
     region_specs=None,
     transition_controls=None,
     transition_region_specs=None,
+    density_mode="Uniform",
+    density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    density_offset_mode="Uniform",
+    density_offset_controls=None,
+    density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
     polydata = generate_hybrid_polydata(
         equation,
@@ -2544,6 +2744,15 @@ def generate_hybrid_freecad_mesh(
         region_specs,
         transition_controls,
         transition_region_specs,
+        density_mode,
+        density_controls,
+        density_count_mode,
+        density_gradient,
+        density_offset_mode,
+        density_offset_controls,
+        density_offset_gradient,
+        grading_resolution,
+        harmonic_boundary_condition,
     )
     return _prepare_freecad_mesh(
         polydata,

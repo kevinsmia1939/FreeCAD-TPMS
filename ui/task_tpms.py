@@ -9,6 +9,7 @@ class TPMSTaskPanel:
         self.obj = obj
         self.generator = tpms_generator
         self.form = QtWidgets.QWidget()
+        self._form_layouts = []
         role_title = "Base Region Parameters" if str(getattr(obj, "RegionRole", "Base")) == "Base" else "TPMS Region Parameters"
         if str(getattr(obj, "RegionRole", "Base")) == "Transition":
             role_title = "Transition Region Parameters"
@@ -313,8 +314,32 @@ class TPMSTaskPanel:
 
         box = QtWidgets.QGroupBox(title)
         form = QtWidgets.QFormLayout(box)
+        self._form_layouts.append(form)
         parent_layout.addWidget(box)
         return form
+
+    def _set_enabled(self, field, enabled):
+        field.setEnabled(enabled)
+        for form in getattr(self, "_form_layouts", []):
+            try:
+                label = form.labelForField(field)
+            except Exception:
+                label = None
+            if label is not None:
+                label.setEnabled(enabled)
+
+    def _set_enabled_many(self, fields, enabled):
+        for field in fields:
+            self._set_enabled(field, enabled)
+
+    def _transition_role_active(self):
+        return self.region_role.currentText() == "Transition"
+
+    def _structure_surface_active(self):
+        return self.surface.currentText() not in (
+            self.generator.SURFACE_EMPTY,
+            self.generator.SURFACE_SOLID_FILL,
+        )
 
     def _spin(self, value, minimum, maximum):
         from PySide import QtWidgets
@@ -395,6 +420,31 @@ class TPMSTaskPanel:
     def _surface_changed(self, name):
         if name in self.generator.SURFACE_EQUATIONS:
             self.equation.setText(self.generator.SURFACE_EQUATIONS[name])
+        elif name in (self.generator.SURFACE_EMPTY, self.generator.SURFACE_SOLID_FILL):
+            self.equation.setText("")
+        self._update_surface_controls()
+        self._update_coordinate_controls()
+        self._update_density_controls()
+        self._update_relax_controls()
+
+    def _update_surface_controls(self):
+        structure_enabled = self._structure_surface_active() and not self._transition_role_active()
+        custom_enabled = self.surface.currentText() == "Custom" and structure_enabled
+        self._set_enabled(self.equation, custom_enabled)
+        self._set_enabled(self.part, structure_enabled)
+        self._set_enabled(self.offset, structure_enabled)
+        self._set_enabled_many(
+            (
+                self.cell_x,
+                self.cell_y,
+                self.cell_z,
+                self.phase_x,
+                self.phase_y,
+                self.phase_z,
+                self.coordinate_mode,
+            ),
+            structure_enabled,
+        )
 
     def _result_text(self):
         return "{} facets, solid={}, non-manifold={}".format(
@@ -608,7 +658,7 @@ class TPMSTaskPanel:
         multi_region = boundary_enabled and len(items) > 1
         self.region_mode.setEnabled(multi_region)
         self.region_index.setEnabled(multi_region and self.region_mode.currentText() == "Single region")
-        self.resolution.setEnabled(self.region_role.currentText() == "Base")
+        self._set_enabled(self.resolution, self.region_role.currentText() == "Base")
         if items:
             self.region_index.setCurrentIndex(max(0, min(current, len(items) - 1)))
         if not multi_region:
@@ -620,8 +670,8 @@ class TPMSTaskPanel:
 
     def _update_transition_controls(self):
         enabled = self.region_role.currentText() == "Transition"
-        self.transition_source.setEnabled(enabled)
-        self.transition_target.setEnabled(enabled)
+        self._set_enabled(self.transition_source, enabled)
+        self._set_enabled(self.transition_target, enabled)
         transition_role = self.region_role.currentText() == "Transition"
         for widget in (
             self.surface,
@@ -634,11 +684,6 @@ class TPMSTaskPanel:
             self.phase_x,
             self.phase_y,
             self.phase_z,
-            self.coordinate_mode,
-            self.ring_radius,
-            self.ring_outer_radius,
-            self.ring_height,
-            self.ring_angular_cells,
             self.density_mode,
             self.density_gradient,
             self.base_density,
@@ -654,48 +699,63 @@ class TPMSTaskPanel:
             self.grading_controls_label,
             self.add_grading_controls,
         ):
-            widget.setEnabled(not transition_role)
+            self._set_enabled(widget, not transition_role)
+        self._update_surface_controls()
+        self._update_coordinate_controls(refresh_boundary=False)
+        self._update_density_controls()
+        self._update_relax_controls()
 
-    def _update_coordinate_controls(self):
-        ring_mode = self.coordinate_mode.currentText() == self.generator.COORDINATE_CYLINDRICAL_RING
+    def _update_coordinate_controls(self, refresh_boundary=True):
+        ring_mode = (
+            self.coordinate_mode.currentText() == self.generator.COORDINATE_CYLINDRICAL_RING
+            and self._structure_surface_active()
+            and not self._transition_role_active()
+        )
         for widget in (
             self.ring_radius,
             self.ring_outer_radius,
             self.ring_height,
             self.ring_angular_cells,
         ):
-            widget.setEnabled(ring_mode)
-        self._update_boundary_controls()
+            self._set_enabled(widget, ring_mode)
+        if refresh_boundary:
+            self._update_boundary_controls()
 
     def _update_density_controls(self):
-        enabled = self.density_mode.currentText() == "Non-uniform"
+        structure_enabled = self._structure_surface_active() and not self._transition_role_active()
+        base_region = self.region_role.currentText() == "Base"
+        grading_owner = structure_enabled and base_region
+        enabled = grading_owner and self.density_mode.currentText() == "Non-uniform"
         face_enabled = enabled and self.density_gradient.currentText() in (
             self.generator.GRADIENT_FACE_DISTANCE,
             self.generator.GRADIENT_FACE_PLANE,
             self.generator.GRADIENT_HARMONIC,
         )
-        self.density_gradient.setEnabled(enabled)
-        self.density_count_mode.setEnabled(enabled)
-        self.face_density.setEnabled(face_enabled)
-        self.density_transition.setEnabled(face_enabled and self.density_gradient.currentText() != self.generator.GRADIENT_HARMONIC)
-        offset_enabled = self.offset_density_mode.currentText() == "Non-uniform"
+        self._set_enabled(self.density_mode, grading_owner)
+        self._set_enabled(self.density_gradient, enabled)
+        self._set_enabled(self.density_count_mode, enabled)
+        self._set_enabled(self.base_density, structure_enabled)
+        self._set_enabled(self.face_density, face_enabled)
+        self._set_enabled(self.density_transition, face_enabled and self.density_gradient.currentText() != self.generator.GRADIENT_HARMONIC)
+        offset_enabled = grading_owner and self.offset_density_mode.currentText() == "Non-uniform"
         offset_face_enabled = offset_enabled and self.offset_density_gradient.currentText() in (
             self.generator.GRADIENT_FACE_DISTANCE,
             self.generator.GRADIENT_FACE_PLANE,
             self.generator.GRADIENT_HARMONIC,
         )
-        self.offset_density_gradient.setEnabled(offset_enabled)
-        self.offset_density_value.setEnabled(offset_enabled)
-        self.offset_density_transition.setEnabled(offset_face_enabled and self.offset_density_gradient.currentText() != self.generator.GRADIENT_HARMONIC)
+        self._set_enabled(self.offset_density_mode, grading_owner)
+        self._set_enabled(self.offset_density_gradient, offset_enabled)
+        self._set_enabled(self.offset_density_value, offset_enabled)
+        self._set_enabled(self.offset_density_transition, offset_face_enabled and self.offset_density_gradient.currentText() != self.generator.GRADIENT_HARMONIC)
         harmonic_enabled = (
             (enabled and self.density_gradient.currentText() == self.generator.GRADIENT_HARMONIC)
             or (offset_enabled and self.offset_density_gradient.currentText() == self.generator.GRADIENT_HARMONIC)
         )
-        self.grading_resolution.setEnabled(harmonic_enabled)
-        self.harmonic_boundary_condition.setEnabled(harmonic_enabled)
+        self._set_enabled(self.grading_resolution, harmonic_enabled)
+        self._set_enabled(self.harmonic_boundary_condition, harmonic_enabled)
         controls_enabled = face_enabled or offset_face_enabled
-        self.grading_controls_label.setEnabled(controls_enabled)
-        self.add_grading_controls.setEnabled(controls_enabled)
+        self._set_enabled(self.grading_controls_label, controls_enabled)
+        self._set_enabled(self.add_grading_controls, controls_enabled)
         self.grading_controls_label.setText(self._grading_controls_text())
 
     def _update_origin_controls(self):
@@ -792,7 +852,16 @@ class TPMSTaskPanel:
         try:
             import FreeCADGui as Gui
             from objects.TPMSUnitCell import add_grading_control
+            from objects.TPMSUnitCell import _base_controller_for
         except Exception:
+            return
+        controller = _base_controller_for(self.obj)
+        if controller is not self.obj:
+            QtWidgets.QMessageBox.warning(
+                self.form,
+                "TPMS Parameters",
+                "Add grading controls from the Base Region Parameters object.",
+            )
             return
 
         use_unit_cell_density = self.density_mode.currentText() == "Non-uniform"
@@ -822,7 +891,7 @@ class TPMSTaskPanel:
                 if not face_names:
                     continue
                 add_grading_control(
-                    self.obj,
+                    controller,
                     source,
                     face_names,
                     self.face_density.value(),
@@ -849,6 +918,10 @@ class TPMSTaskPanel:
 
     def _apply_grading_settings(self):
         obj = self.obj
+        if self.region_role.currentText() != "Base":
+            obj.BaseDensity = float(self.base_density.value())
+            obj.touch()
+            return
         obj.DensityMode = self.density_mode.currentText()
         obj.DensityGradient = self.density_gradient.currentText()
         obj.BaseDensity = float(self.base_density.value())

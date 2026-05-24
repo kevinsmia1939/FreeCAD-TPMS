@@ -8,9 +8,11 @@ class TPMSGradingTaskPanel:
         self.obj = obj
         self.form = QtWidgets.QWidget()
         self.form.setWindowTitle("TPMS Grading")
+        self._form_layouts = []
 
         layout = QtWidgets.QVBoxLayout(self.form)
         form = QtWidgets.QFormLayout()
+        self._form_layouts.append(form)
         layout.addLayout(form)
 
         self.enabled = QtWidgets.QCheckBox()
@@ -81,6 +83,50 @@ class TPMSGradingTaskPanel:
         widget.setStatusTip(text)
         widget.setWhatsThis(text)
 
+    def _set_enabled(self, field, enabled):
+        field.setEnabled(enabled)
+        for form in getattr(self, "_form_layouts", []):
+            try:
+                label = form.labelForField(field)
+            except Exception:
+                label = None
+            if label is not None:
+                label.setEnabled(enabled)
+
+    def _controller(self):
+        doc = getattr(self.obj, "Document", None)
+        if doc is None:
+            return None
+        for candidate in doc.Objects:
+            controls = list(getattr(candidate, "FaceControls", [])) + list(
+                getattr(candidate, "DensityOffsetControls", [])
+            )
+            if self.obj in controls:
+                return candidate
+        return None
+
+    def _uses_harmonic_unit_cell_density(self):
+        controller = self._controller()
+        if controller is None:
+            return False
+        try:
+            import tpms_generator
+
+            return str(getattr(controller, "DensityGradient", "")) == tpms_generator.GRADIENT_HARMONIC
+        except Exception:
+            return False
+
+    def _uses_harmonic_thickness(self):
+        controller = self._controller()
+        if controller is None:
+            return False
+        try:
+            import tpms_generator
+
+            return str(getattr(controller, "DensityOffsetGradient", "")) == tpms_generator.GRADIENT_HARMONIC
+        except Exception:
+            return False
+
     def _set_tooltips(self):
         self._set_tip(self.enabled, "Turns this selected-face grading control on or off without deleting it.")
         self._set_tip(self.source, "The solid whose face selection created this grading control.")
@@ -113,10 +159,10 @@ class TPMSGradingTaskPanel:
     def _update_controls(self):
         density_enabled = self.use_unit_cell_density.isChecked()
         thickness_enabled = self.use_thickness.isChecked()
-        self.density_factor.setEnabled(density_enabled)
-        self.unit_cell_transition.setEnabled(density_enabled)
-        self.offset_value.setEnabled(thickness_enabled)
-        self.thickness_transition.setEnabled(thickness_enabled)
+        self._set_enabled(self.density_factor, density_enabled)
+        self._set_enabled(self.unit_cell_transition, density_enabled and not self._uses_harmonic_unit_cell_density())
+        self._set_enabled(self.offset_value, thickness_enabled)
+        self._set_enabled(self.thickness_transition, thickness_enabled and not self._uses_harmonic_thickness())
 
     def accept(self):
         obj = self.obj

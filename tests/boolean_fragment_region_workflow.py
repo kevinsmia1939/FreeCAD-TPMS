@@ -20,6 +20,7 @@ from objects.TPMSUnitCell import (
     REGION_ROLE_OVERRIDE,
     REGION_ROLE_TRANSITION,
     REGION_MODE_ALL,
+    add_grading_control,
     add_tpms_region_settings_for_all_regions,
     boundary_region_items,
     is_tpms_unit_cell,
@@ -34,6 +35,7 @@ TEST_FILES = (
     "boolean_fragment_test2.FCStd",
     "boolean_fragment_test3.FCStd",
 )
+HARMONIC_DENSITY_FILE = "harmonic_unit_cell.FCStd"
 
 
 def _find_boundary(doc):
@@ -288,6 +290,7 @@ def run_generated_transition_region_case():
         transition.TransitionTargetRegion = 2
         target.Surface = "Schwarz P"
         target.Equation = tpms_generator.SURFACE_EQUATIONS["Schwarz P"]
+        target.Part = tpms_generator.PART_UPPER
         target.BaseDensity = 1.35
         target.Offset = 0.65
         _assert_transition_weight_varies(solids[0], solids[1], solids[2])
@@ -315,6 +318,206 @@ def run_generated_transition_region_case():
         )
     finally:
         App.closeDocument(doc.Name)
+
+
+def run_region_grading_separation_case():
+    import hashlib
+    import Part
+
+    doc = App.newDocument("TPMS_region_grading_separation_test")
+    try:
+        solids = [
+            Part.makeBox(10.0, 10.0, 10.0, App.Vector(0.0, 0.0, 0.0)),
+            Part.makeBox(10.0, 10.0, 10.0, App.Vector(10.0, 0.0, 0.0)),
+        ]
+        boundary = doc.addObject("Part::Feature", "Two_Region_Fragment")
+        boundary.Label = "Two Region BooleanFragments Equivalent"
+        boundary.Shape = Part.makeCompound(solids)
+
+        _container, controller, _mesh_obj = make_tpms_unit_cell(doc)
+        _configure_fast(controller, boundary)
+        controller.Resolution = 8
+        controller.AddCaps = True
+        controller.BaseDensity = 1.0
+        controller.DensityGradient = tpms_generator.GRADIENT_FACE_DISTANCE
+        add_grading_control(
+            controller,
+            boundary,
+            ["Face1"],
+            unit_cell_density=1.8,
+            unit_cell_transition=8.0,
+            thickness=None,
+            thickness_transition=None,
+            use_unit_cell_density=True,
+            use_thickness=False,
+        )
+        created = add_tpms_region_settings_for_all_regions(controller, skip_existing=True)
+        if len(created) != 1:
+            raise RuntimeError("Expected one added region setting, got {}".format(len(created)))
+        region_controller = created[0][0]
+        if list(getattr(region_controller, "FaceControls", [])):
+            raise RuntimeError("Region controller copied unit-cell grading controls")
+        if list(getattr(region_controller, "DensityOffsetControls", [])):
+            raise RuntimeError("Region controller copied thickness grading controls")
+        if str(getattr(region_controller, "DensityMode", "Uniform")) != "Uniform":
+            raise RuntimeError("Region controller copied non-uniform density mode")
+        if str(getattr(region_controller, "DensityOffsetMode", "Uniform")) != "Uniform":
+            raise RuntimeError("Region controller copied non-uniform thickness mode")
+
+        signatures = []
+        for mode in ("Uniform", "Non-uniform"):
+            controller.DensityMode = mode
+            controller.touch()
+            doc.recompute()
+            mesh = controller.ResultMesh.Mesh
+            sample = [
+                (round(point.x, 5), round(point.y, 5), round(point.z, 5))
+                for point in mesh.Points[:1000]
+            ]
+            signatures.append((mode, int(mesh.CountFacets), hashlib.sha256(repr(sample).encode("utf-8")).hexdigest()[:16]))
+        if signatures[0][1:] == signatures[1][1:]:
+            raise RuntimeError("Base grading did not change hybrid region mesh signature: {}".format(signatures))
+        print(
+            "PASS region_grading_separation uniform_facets={} graded_facets={} uniform_hash={} graded_hash={}".format(
+                signatures[0][1],
+                signatures[1][1],
+                signatures[0][2],
+                signatures[1][2],
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def _hybrid_transition_polydata(source_surface, source_part, target_surface, target_part):
+    import Part
+
+    solids = [
+        Part.makeBox(10.0, 10.0, 10.0, App.Vector(0.0, 0.0, 0.0)),
+        Part.makeBox(10.0, 10.0, 10.0, App.Vector(10.0, 0.0, 0.0)),
+        Part.makeBox(10.0, 10.0, 10.0, App.Vector(20.0, 0.0, 0.0)),
+    ]
+    source_equation = tpms_generator.SURFACE_EQUATIONS.get(source_surface, "")
+    target_equation = tpms_generator.SURFACE_EQUATIONS.get(target_surface, "")
+    source = _BoundaryProbe(solids[0])
+    transition = _BoundaryProbe(solids[1])
+    target = _BoundaryProbe(solids[2])
+    outer_shape = solids[0].multiFuse(solids[1:])
+    try:
+        outer_shape = outer_shape.removeSplitter()
+    except Exception:
+        pass
+    outer = _BoundaryProbe(outer_shape)
+    return tpms_generator.generate_hybrid_polydata(
+        tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        tpms_generator.PART_SHEET,
+        (10.0, 10.0, 10.0),
+        (1, 1, 1),
+        10,
+        0.4,
+        (0.0, 0.0, 0.0),
+        tpms_generator.BOUNDARY_SELECTED_SOLID,
+        outer,
+        0.0,
+        True,
+        None,
+        None,
+        1.0,
+        [
+            {
+                "index": 0,
+                "boundary_object": source,
+                "surface": source_surface,
+                "part": source_part,
+                "equation": source_equation,
+                "offset": 0.4,
+                "base_density": 1.0,
+            },
+            {
+                "index": 2,
+                "boundary_object": target,
+                "surface": target_surface,
+                "part": target_part,
+                "equation": target_equation,
+                "offset": 0.65,
+                "base_density": 1.2,
+            },
+        ],
+        [],
+        [
+            {
+                "index": 1,
+                "boundary_object": transition,
+                "source_boundary_object": source,
+                "source_surface": source_surface,
+                "source_part": source_part,
+                "source_equation": source_equation,
+                "source_offset": 0.4,
+                "source_base_density": 1.0,
+                "target_boundary_object": target,
+                "target_surface": target_surface,
+                "target_part": target_part,
+                "target_equation": target_equation,
+                "target_offset": 0.65,
+                "target_base_density": 1.2,
+            },
+        ],
+    )
+
+
+def _assert_valid_polydata(name, polydata):
+    if polydata.n_points <= 0 or polydata.n_cells <= 0:
+        raise RuntimeError("{} generated empty polydata".format(name))
+    mesh = tpms_generator.polydata_to_freecad_mesh(polydata)
+    if mesh.CountFacets <= 0:
+        raise RuntimeError("{} converted to an empty FreeCAD mesh".format(name))
+    if mesh.hasNonManifolds():
+        raise RuntimeError("{} generated non-manifold points".format(name))
+    if _has_degenerate_facets(mesh):
+        raise RuntimeError("{} generated degenerate facets".format(name))
+    return mesh
+
+
+def run_transition_region_surface_modes_case():
+    sheet_to_upper = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_SHEET,
+        "Schwarz P",
+        tpms_generator.PART_UPPER,
+    )
+    sheet_mesh = _assert_valid_polydata("Sheet to upper-skeletal transition", sheet_to_upper)
+
+    empty_to_solid = _hybrid_transition_polydata(
+        tpms_generator.SURFACE_EMPTY,
+        tpms_generator.PART_SHEET,
+        tpms_generator.SURFACE_SOLID_FILL,
+        tpms_generator.PART_SHEET,
+    )
+    solid_mesh = _assert_valid_polydata("Empty to solid-fill transition", empty_to_solid)
+    bounds = solid_mesh.BoundBox
+    if bounds.XMin < 13.0 or bounds.XMax < 29.5:
+        raise RuntimeError(
+            "Empty to solid-fill transition occupied unexpected bounds: ({:.3f}, {:.3f})".format(
+                bounds.XMin,
+                bounds.XMax,
+            )
+        )
+
+    empty_to_tpms = _hybrid_transition_polydata(
+        tpms_generator.SURFACE_EMPTY,
+        tpms_generator.PART_SHEET,
+        "Gyroid",
+        tpms_generator.PART_LOWER,
+    )
+    lower_mesh = _assert_valid_polydata("Empty to lower-skeletal transition", empty_to_tpms)
+
+    print(
+        "PASS transition_region_surface_modes sheet_upper_facets={} empty_solid_facets={} empty_lower_facets={}".format(
+            int(sheet_mesh.CountFacets),
+            int(solid_mesh.CountFacets),
+            int(lower_mesh.CountFacets),
+        )
+    )
 
 
 def run_cylindrical_ring_boundary_origin_case():
@@ -408,11 +611,56 @@ def run_cylindrical_ring_boundary_origin_case():
     )
 
 
+def run_harmonic_density_count_mode_case():
+    import hashlib
+
+    path = os.path.join(STUDY_DIR, HARMONIC_DENSITY_FILE)
+    doc = App.openDocument(path)
+    try:
+        controller = None
+        for obj in doc.Objects:
+            if is_tpms_unit_cell(obj):
+                controller = obj
+                break
+        if controller is None:
+            raise RuntimeError("No TPMS controller found in {}".format(path))
+
+        results = []
+        for mode in (tpms_generator.DENSITY_COUNT_FOLLOW, tpms_generator.DENSITY_COUNT_PRESERVE):
+            controller.DensityCountMode = mode
+            controller.touch()
+            doc.recompute()
+            mesh_obj = getattr(controller, "ResultMesh", None)
+            if mesh_obj is None or mesh_obj.Mesh.CountFacets <= 0:
+                raise RuntimeError("{} generated no mesh for {}".format(path, mode))
+            sample = [
+                (round(point.x, 5), round(point.y, 5), round(point.z, 5))
+                for point in mesh_obj.Mesh.Points[:2000]
+            ]
+            digest = hashlib.sha256(repr(sample).encode("utf-8")).hexdigest()[:16]
+            results.append((mode, int(mesh_obj.Mesh.CountFacets), digest))
+        if results[0][1:] == results[1][1:]:
+            raise RuntimeError("Harmonic density count modes produced identical mesh signatures: {}".format(results))
+        print(
+            "PASS harmonic_density_count_mode follow_facets={} preserve_facets={} follow_hash={} preserve_hash={}".format(
+                results[0][1],
+                results[1][1],
+                results[0][2],
+                results[1][2],
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def main():
     for name in TEST_FILES:
         run_file(os.path.join(STUDY_DIR, name))
     run_generated_transition_region_case()
+    run_region_grading_separation_case()
+    run_transition_region_surface_modes_case()
     run_cylindrical_ring_boundary_origin_case()
+    run_harmonic_density_count_mode_case()
 
 
 if not getattr(App, "_tpms_boolean_fragment_region_workflow_ran", False):

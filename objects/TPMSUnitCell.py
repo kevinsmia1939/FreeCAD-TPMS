@@ -175,20 +175,7 @@ def _copy_tpms_settings(source, target):
         "RotationMode",
         "OriginRotation",
         "RotationObject",
-        "DensityMode",
-        "DensityGradient",
         "BaseDensity",
-        "DensityCountMode",
-        "FaceDensity",
-        "DensityTransition",
-        "FaceControls",
-        "DensityOffsetMode",
-        "DensityOffsetGradient",
-        "DensityOffsetValue",
-        "DensityOffsetTransition",
-        "DensityOffsetControls",
-        "GradingResolution",
-        "HarmonicBoundaryCondition",
         "MeshStitching",
         "BoundaryMode",
         "BoundaryObject",
@@ -349,6 +336,14 @@ class TPMSUnitCell:
         if not hasattr(obj, "Surface"):
             obj.addProperty("App::PropertyEnumeration", "Surface", "TPMS", "Preset TPMS equation")
             obj.Surface = tpms_generator.surface_names() + ["Custom"]
+        else:
+            try:
+                current_surface = str(obj.Surface)
+                surface_options = tpms_generator.surface_names() + ["Custom"]
+                obj.Surface = surface_options
+                obj.Surface = current_surface if current_surface in surface_options else "Custom"
+            except Exception:
+                pass
         if not hasattr(obj, "Equation"):
             obj.addProperty("App::PropertyString", "Equation", "TPMS", "Implicit equation using x, y, z")
         if not hasattr(obj, "Part"):
@@ -554,11 +549,19 @@ class TPMSUnitCell:
         self._add_properties(obj)
 
     def onChanged(self, obj, prop):
-        if prop == "Surface" and getattr(obj, "Surface", "") != "Custom":
-            try:
-                import tpms_generator
+        import tpms_generator
 
+        if prop == "Surface" and str(getattr(obj, "Surface", "")) in tpms_generator.SURFACE_EQUATIONS:
+            try:
                 obj.Equation = tpms_generator.SURFACE_EQUATIONS[str(obj.Surface)]
+            except Exception:
+                pass
+        if prop == "Surface" and str(getattr(obj, "Surface", "")) in (
+            tpms_generator.SURFACE_EMPTY,
+            tpms_generator.SURFACE_SOLID_FILL,
+        ):
+            try:
+                obj.Equation = ""
             except Exception:
                 pass
         if prop in ("RegionRole", "RegionMode"):
@@ -885,6 +888,8 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
     phase = _vector_tuple(getattr(base, "Phase", App.Vector(0.0, 0.0, 0.0)), fallback=(0.0, 0.0, 0.0), minimum=None)
     region_specs = _hybrid_region_specs(base, items)
     transition_region_specs = _hybrid_transition_region_specs(base, items)
+    unit_cell_controls = _unit_cell_controls(base)
+    density_offset_controls = _density_offset_controls(base)
     return tpms_generator.generate_hybrid_freecad_mesh(
         str(getattr(base, "Equation", "")),
         str(getattr(base, "Part", tpms_generator.PART_SHEET)),
@@ -907,6 +912,15 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         region_specs,
         [],
         transition_region_specs,
+        str(getattr(base, "DensityMode", "Uniform")),
+        unit_cell_controls,
+        str(getattr(base, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW)),
+        str(getattr(base, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+        str(getattr(base, "DensityOffsetMode", "Uniform")),
+        density_offset_controls,
+        str(getattr(base, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+        max(0, int(getattr(base, "GradingResolution", 16))),
+        str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
     )
 
 
@@ -928,6 +942,8 @@ def _hybrid_outer_boundary(base, items):
 
 
 def _hybrid_region_specs(base, items):
+    import tpms_generator
+
     specs = []
     for item in items:
         setting = _region_generation_setting(base, int(item["index"]))
@@ -937,6 +953,8 @@ def _hybrid_region_specs(base, items):
             {
                 "index": int(item["index"]),
                 "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
+                "surface": str(getattr(setting, "Surface", getattr(base, "Surface", "Custom"))),
+                "part": str(getattr(setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET))),
                 "equation": str(getattr(setting, "Equation", getattr(base, "Equation", ""))),
                 "offset": float(getattr(setting, "Offset", getattr(base, "Offset", 0.3))),
                 "base_density": max(0.05, float(getattr(setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
@@ -946,6 +964,8 @@ def _hybrid_region_specs(base, items):
 
 
 def _hybrid_transition_region_specs(base, items):
+    import tpms_generator
+
     specs = []
     item_by_index = {int(item["index"]): item for item in items}
     for item in items:
@@ -970,11 +990,15 @@ def _hybrid_transition_region_specs(base, items):
                 "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
                 "source_index": source_index,
                 "source_boundary_object": _ShapeBoundaryAdapter(source_item["solid"], source_item["label"]),
+                "source_surface": str(getattr(source_setting, "Surface", getattr(base, "Surface", "Custom"))),
+                "source_part": str(getattr(source_setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET))),
                 "source_equation": str(getattr(source_setting, "Equation", getattr(base, "Equation", ""))),
                 "source_offset": float(getattr(source_setting, "Offset", getattr(base, "Offset", 0.3))),
                 "source_base_density": max(0.05, float(getattr(source_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
                 "target_index": target_index,
                 "target_boundary_object": _ShapeBoundaryAdapter(target_item["solid"], target_item["label"]),
+                "target_surface": str(getattr(target_setting, "Surface", getattr(base, "Surface", "Custom"))),
+                "target_part": str(getattr(target_setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET))),
                 "target_equation": str(getattr(target_setting, "Equation", getattr(base, "Equation", ""))),
                 "target_offset": float(getattr(target_setting, "Offset", getattr(base, "Offset", 0.3))),
                 "target_base_density": max(0.05, float(getattr(target_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
