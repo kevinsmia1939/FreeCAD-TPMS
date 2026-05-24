@@ -84,6 +84,14 @@ class TPMSTaskPanel:
         boundary_object_layout.addWidget(self.boundary_select)
         tpms_layout.addRow("Selected boundary", boundary_object_layout)
 
+        self.region_mode = QtWidgets.QComboBox()
+        self.region_mode.addItems(["All regions", "Single region"])
+        self.region_mode.setCurrentText(str(getattr(obj, "RegionMode", "All regions")))
+        tpms_layout.addRow("Boundary regions", self.region_mode)
+
+        self.region_index = QtWidgets.QComboBox()
+        tpms_layout.addRow("Selected region", self.region_index)
+
         self.sampling = self._double_spin(float(getattr(obj, "Sampling", 0.0)), 0.0, 100000.0, 0.1)
         self.sampling.setSpecialValueText("Use resolution")
         tpms_layout.addRow("Sampling resolution", self.sampling)
@@ -262,6 +270,7 @@ class TPMSTaskPanel:
         self.offset_density_gradient.currentTextChanged.connect(self._update_density_controls)
         self.add_grading_controls.clicked.connect(self._add_selected_grading_controls)
         self.boundary_select.clicked.connect(self._use_selected_boundary)
+        self.region_mode.currentTextChanged.connect(self._update_region_controls)
         self.origin_select.clicked.connect(self._use_selected_origin)
         self.rotation_select.clicked.connect(self._use_selected_rotation)
         self.boundary_mode.currentTextChanged.connect(self._update_boundary_controls)
@@ -325,6 +334,8 @@ class TPMSTaskPanel:
         self._set_tip(self.ring_angular_cells, "Number of TPMS periods around the full 360 degree ring.")
         self._set_tip(self.boundary_mode, "Boundary used to clip and cap the generated TPMS.")
         self._set_tip(self.boundary_select, "Use the currently selected solid or mesh as the TPMS boundary.")
+        self._set_tip(self.region_mode, "For BooleanFragments or compounds with multiple solids, choose whether this TPMS parameter fills all regions or one solid region.")
+        self._set_tip(self.region_index, "Solid region used when Boundary regions is set to Single region. Region order comes from the FreeCAD shape solids.")
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
         self._set_tip(self.density_mode, "Enable non-uniform unit-cell density grading from selected faces.")
@@ -398,6 +409,14 @@ class TPMSTaskPanel:
         if hasattr(self, "_pending_boundary_object"):
             return self._pending_boundary_object
         return getattr(self.obj, "BoundaryObject", None)
+
+    def _region_items(self):
+        try:
+            from objects.TPMSUnitCell import boundary_region_items
+
+            return boundary_region_items(self._current_boundary_object())
+        except Exception:
+            return []
 
     def _boundary_method_text(self):
         if (
@@ -535,7 +554,32 @@ class TPMSTaskPanel:
         self.boundary_label.setEnabled(enabled)
         self.boundary_select.setEnabled(enabled)
         self.sampling.setEnabled(enabled)
+        self._update_region_controls(enabled)
         self.boundary_method.setText(self._boundary_method_text())
+
+    def _update_region_controls(self, boundary_enabled=None):
+        if boundary_enabled is None:
+            boundary_enabled = self.boundary_mode.currentText() == self.generator.BOUNDARY_SELECTED_SOLID
+        items = self._region_items() if boundary_enabled else []
+        current = int(getattr(self.obj, "RegionIndex", 0))
+        if hasattr(self, "_pending_region_index"):
+            current = int(self._pending_region_index)
+
+        self.region_index.blockSignals(True)
+        self.region_index.clear()
+        for item in items:
+            self.region_index.addItem(item["label"], item["index"])
+        if not items:
+            self.region_index.addItem("No solid regions", 0)
+        self.region_index.blockSignals(False)
+
+        multi_region = boundary_enabled and len(items) > 1
+        self.region_mode.setEnabled(multi_region)
+        self.region_index.setEnabled(multi_region and self.region_mode.currentText() == "Single region")
+        if items:
+            self.region_index.setCurrentIndex(max(0, min(current, len(items) - 1)))
+        if not multi_region:
+            self.region_mode.setCurrentText("All regions")
 
     def _update_coordinate_controls(self):
         ring_mode = self.coordinate_mode.currentText() == self.generator.COORDINATE_CYLINDRICAL_RING
@@ -636,6 +680,7 @@ class TPMSTaskPanel:
 
     def _set_boundary_object(self, boundary):
         self._pending_boundary_object = boundary
+        self._pending_region_index = 0
         self.boundary_label.setText(getattr(boundary, "Label", getattr(boundary, "Name", "Selected object")))
         self.boundary_mode.setCurrentText(self.generator.BOUNDARY_SELECTED_SOLID)
         self._update_boundary_controls()
@@ -648,6 +693,8 @@ class TPMSTaskPanel:
         try:
             obj.BoundaryMode = self.boundary_mode.currentText()
             obj.BoundaryObject = self._current_boundary_object()
+            obj.RegionMode = self.region_mode.currentText()
+            obj.RegionIndex = int(self.region_index.currentData() or 0)
             obj.Sampling = float(self.sampling.value())
             obj.AddCaps = bool(self.add_caps.isChecked())
             obj.touch()
@@ -816,6 +863,8 @@ class TPMSTaskPanel:
             obj.BoundaryMode = self.boundary_mode.currentText()
             if hasattr(self, "_pending_boundary_object"):
                 obj.BoundaryObject = self._pending_boundary_object
+            obj.RegionMode = self.region_mode.currentText()
+            obj.RegionIndex = int(self.region_index.currentData() or 0)
             obj.Sampling = float(self.sampling.value())
             obj.AddCaps = bool(self.add_caps.isChecked())
             obj.MeshRelaxation = bool(self.mesh_relaxation.isChecked())

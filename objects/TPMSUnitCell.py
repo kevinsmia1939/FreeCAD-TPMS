@@ -2,6 +2,10 @@ import FreeCAD as App
 import Part
 
 
+REGION_MODE_ALL = "All regions"
+REGION_MODE_SINGLE = "Single region"
+
+
 def make_tpms_unit_cell(doc=None):
     import tpms_generator
 
@@ -57,6 +61,8 @@ def make_tpms_unit_cell(doc=None):
     controller.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR
     controller.MeshStitching = False
     controller.BoundaryMode = tpms_generator.BOUNDARY_BOX
+    controller.RegionMode = REGION_MODE_ALL
+    controller.RegionIndex = 0
     controller.Sampling = 0.0
     controller.AddCaps = True
     controller.MeshRelaxation = False
@@ -66,6 +72,109 @@ def make_tpms_unit_cell(doc=None):
 
     doc.recompute()
     return container, controller, mesh_obj
+
+
+def add_tpms_region_settings(source_controller):
+    if not is_tpms_unit_cell(source_controller):
+        raise ValueError("Select a TPMS Parameters object first.")
+
+    doc = source_controller.Document
+    container = _container_for(source_controller)
+    controller = doc.addObject("Part::FeaturePython", "TPMS_Region_Parameters")
+    controller.Label = "TPMS Region Parameters"
+    TPMSUnitCell(controller)
+    _set_controller_shape(controller)
+    if getattr(controller, "ViewObject", None) is not None:
+        TPMSUnitCellViewProvider(controller.ViewObject)
+        _configure_controller_view(controller.ViewObject)
+
+    mesh_obj = doc.addObject("Mesh::Feature", "TPMS_Region_Mesh")
+    mesh_obj.Label = "TPMS Region Mesh"
+    if container is not None:
+        container.addObject(controller)
+        container.addObject(mesh_obj)
+    controller.ResultMesh = mesh_obj
+
+    _copy_tpms_settings(source_controller, controller)
+    controller.RegionMode = REGION_MODE_SINGLE
+    controller.RegionIndex = _next_region_index(source_controller)
+    return controller, mesh_obj
+
+
+def _copy_tpms_settings(source, target):
+    names = (
+        "Surface",
+        "Equation",
+        "Part",
+        "Resolution",
+        "RepeatX",
+        "RepeatY",
+        "RepeatZ",
+        "Offset",
+        "CellSize",
+        "Phase",
+        "CoordinateMode",
+        "RingRadius",
+        "RingOuterRadius",
+        "RingHeight",
+        "RingAngularCells",
+        "OriginMode",
+        "Origin",
+        "OriginObject",
+        "RotationMode",
+        "OriginRotation",
+        "RotationObject",
+        "DensityMode",
+        "DensityGradient",
+        "BaseDensity",
+        "DensityCountMode",
+        "FaceDensity",
+        "DensityTransition",
+        "FaceControls",
+        "DensityOffsetMode",
+        "DensityOffsetGradient",
+        "DensityOffsetValue",
+        "DensityOffsetTransition",
+        "DensityOffsetControls",
+        "GradingResolution",
+        "HarmonicBoundaryCondition",
+        "MeshStitching",
+        "BoundaryMode",
+        "BoundaryObject",
+        "Sampling",
+        "AddCaps",
+        "MeshRelaxation",
+        "RelaxIterations",
+        "RelaxSkipBoundary",
+        "RelaxCapSurface",
+    )
+    for name in names:
+        if hasattr(source, name) and hasattr(target, name):
+            try:
+                setattr(target, name, getattr(source, name))
+            except Exception:
+                pass
+
+
+def _next_region_index(source_controller):
+    items = boundary_region_items(getattr(source_controller, "BoundaryObject", None))
+    if not items:
+        return 0
+    used = set()
+    container = _container_for(source_controller)
+    for obj in getattr(source_controller.Document, "Objects", []):
+        if not is_tpms_unit_cell(obj):
+            continue
+        if container is not None and _container_for(obj) != container:
+            continue
+        if getattr(obj, "BoundaryObject", None) != getattr(source_controller, "BoundaryObject", None):
+            continue
+        if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE:
+            used.add(int(getattr(obj, "RegionIndex", 0)))
+    for item in items:
+        if item["index"] not in used:
+            return item["index"]
+    return items[-1]["index"]
 
 
 class TPMSUnitCell:
@@ -208,6 +317,19 @@ class TPMSUnitCell:
             obj.BoundaryMode = tpms_generator.boundary_modes()
         if not hasattr(obj, "BoundaryObject"):
             obj.addProperty("App::PropertyXLink", "BoundaryObject", "TPMS", "Selected solid or mesh used as boundary")
+        if not hasattr(obj, "RegionMode"):
+            obj.addProperty("App::PropertyEnumeration", "RegionMode", "TPMS", "Region selection for multi-solid boundaries")
+            obj.RegionMode = [REGION_MODE_ALL, REGION_MODE_SINGLE]
+            obj.RegionMode = REGION_MODE_ALL
+        if not hasattr(obj, "RegionIndex"):
+            obj.addProperty("App::PropertyInteger", "RegionIndex", "TPMS", "Zero-based solid region index inside a multi-solid boundary")
+            obj.RegionIndex = 0
+        if not hasattr(obj, "RegionCount"):
+            obj.addProperty("App::PropertyInteger", "RegionCount", "Result", "Detected solid region count in the boundary")
+            obj.setEditorMode("RegionCount", 1)
+        if not hasattr(obj, "RegionDescription"):
+            obj.addProperty("App::PropertyString", "RegionDescription", "Result", "Current boundary region used for generation")
+            obj.setEditorMode("RegionDescription", 1)
         if not hasattr(obj, "Sampling"):
             obj.addProperty("App::PropertyFloat", "Sampling", "TPMS", "Target grid resolution along the longest sampled axis; 0 uses Resolution")
             obj.Sampling = 0.0
@@ -274,6 +396,9 @@ class TPMSUnitCell:
             origin_rotation = _origin_rotation(obj)
             unit_cell_controls = _unit_cell_controls(obj)
             density_offset_controls = _density_offset_controls(obj)
+            boundary_object, region_description, region_count = selected_boundary_region(obj)
+            obj.RegionCount = int(region_count)
+            obj.RegionDescription = region_description
             mesh = tpms_generator.generate_freecad_mesh(
                 obj.Equation,
                 str(obj.Part),
@@ -284,7 +409,7 @@ class TPMSUnitCell:
                 phase,
                 bool(getattr(obj, "MeshStitching", False)),
                 str(getattr(obj, "BoundaryMode", tpms_generator.BOUNDARY_BOX)),
-                getattr(obj, "BoundaryObject", None),
+                boundary_object,
                 max(0.0, float(getattr(obj, "Sampling", 0.0))),
                 bool(getattr(obj, "AddCaps", True)),
                 bool(getattr(obj, "MeshRelaxation", False)),
@@ -359,6 +484,76 @@ class TPMSUnitCellViewProvider:
 
 def is_tpms_unit_cell(obj):
     return hasattr(obj, "Proxy") and isinstance(obj.Proxy, TPMSUnitCell)
+
+
+class _ShapeBoundaryAdapter:
+    TypeId = "TPMS::BoundaryRegion"
+
+    def __init__(self, shape, label):
+        self.Shape = shape
+        self.Label = label
+        self.Name = label
+        self.Placement = App.Placement()
+
+
+def boundary_region_solids(boundary_object):
+    shape = getattr(boundary_object, "Shape", None)
+    if shape is None or shape.isNull():
+        return []
+    solids = list(getattr(shape, "Solids", []))
+    if solids:
+        return solids
+    try:
+        if shape.ShapeType == "Solid":
+            return [shape]
+    except Exception:
+        pass
+    return []
+
+
+def boundary_region_items(boundary_object):
+    items = []
+    for index, solid in enumerate(boundary_region_solids(boundary_object)):
+        bb = solid.BoundBox
+        try:
+            center = solid.CenterOfMass
+            center_text = "center {:.3f}, {:.3f}, {:.3f}".format(float(center.x), float(center.y), float(center.z))
+        except Exception:
+            center_text = "center unavailable"
+        try:
+            volume_text = "volume {:.3f}".format(float(solid.Volume))
+        except Exception:
+            volume_text = "volume unavailable"
+        items.append(
+            {
+                "index": index,
+                "label": "Region {} ({}, {}, size {:.3f} x {:.3f} x {:.3f})".format(
+                    index + 1,
+                    volume_text,
+                    center_text,
+                    float(bb.XLength),
+                    float(bb.YLength),
+                    float(bb.ZLength),
+                ),
+                "solid": solid,
+            }
+        )
+    return items
+
+
+def selected_boundary_region(controller):
+    boundary = getattr(controller, "BoundaryObject", None)
+    items = boundary_region_items(boundary)
+    if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE or len(items) <= 1:
+        if len(items) > 1:
+            return boundary, "All {} regions".format(len(items)), len(items)
+        if len(items) == 1:
+            return boundary, "Region 1", 1
+        return boundary, "No solid regions detected", 0
+
+    index = max(0, min(int(getattr(controller, "RegionIndex", 0)), len(items) - 1))
+    item = items[index]
+    return _ShapeBoundaryAdapter(item["solid"], item["label"]), item["label"], len(items)
 
 
 class TPMSFaceDensityControl:

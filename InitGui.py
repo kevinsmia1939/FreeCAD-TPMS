@@ -15,8 +15,9 @@ class TPMSGeneratorWorkbench(Workbench):
 
     def Initialize(self):
         import commands.CmdGenerateTPMS
+        import commands.CmdAddTPMSRegion
 
-        tool_list = ["TPMSGenerator_GenerateUnitCell"]
+        tool_list = ["TPMSGenerator_GenerateUnitCell", "TPMSGenerator_AddRegionSettings"]
         self.appendToolbar("TPMS Generator", tool_list)
         self.appendMenu("&TPMS Generator", tool_list)
 
