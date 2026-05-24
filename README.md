@@ -71,23 +71,5 @@ coordinates.  With `Origin Mode` set to `Boundary object`, the ring center
 follows the selected boundary object's placement.  Tube boundaries can be used
 to clip the ring directly.
 
-## Tests
-
-Run the headless workflow test from this folder:
-
-```bash
-python3 -m py_compile tpms_generator.py objects/TPMSUnitCell.py ui/task_tpms.py tests/boolean_fragment_region_workflow.py
-FreeCADCmd -c "import runpy; runpy.run_path('tests/boolean_fragment_region_workflow.py', run_name='__main__')"
-```
-
-The workflow test checks BooleanFragments region handling, transition-region
-generation, cylindrical ring origin handling, and basic mesh validity.
-
-## Notes
-
-- Higher mesh resolution increases generation time and memory use quickly.
-- Mesh relaxation is optional and off by default for predictable boundaries.
-- Capping is on by default so generated sheet and skeletal meshes can be closed
-  against the selected boundary.
-- `example/example1.FCStd` and `example/screenshot.png` show a multi-region TPMS
-  setup in FreeCAD.
+## License
+GPL-3.0 license
