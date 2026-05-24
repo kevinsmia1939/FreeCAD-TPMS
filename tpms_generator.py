@@ -542,6 +542,44 @@ def _smooth_falloff_weight(distance, transition):
     return 1.0 - smooth
 
 
+def _smoothstep(t):
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _blend_equation_field(base_field, x, y, z, wx, wy, wz, equation_blend_controls=None):
+    field = np.asarray(base_field, dtype=float)
+    for control in equation_blend_controls or []:
+        equation = str(control.get("equation", "")).strip()
+        if not equation:
+            continue
+        try:
+            target = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
+            if target.shape == ():
+                target = np.full(field.shape, float(target), dtype=float)
+            if target.shape != field.shape:
+                continue
+            if control.get("type") == "face_distance":
+                distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            else:
+                point = np.asarray(control["point"], dtype=float)
+                normal = np.asarray(control["normal"], dtype=float)
+                normal_length = float(np.linalg.norm(normal))
+                if normal_length <= 1e-12:
+                    continue
+                normal = normal / normal_length
+                distance = np.abs(
+                    (wx - point[0]) * normal[0]
+                    + (wy - point[1]) * normal[1]
+                    + (wz - point[2]) * normal[2]
+                )
+            weight = _smooth_falloff_weight(distance, max(1e-9, float(control.get("transition", 1.0))))
+            field = field + weight * (target - field)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring TPMS equation blend control: {}\n".format(exc))
+    return field
+
+
 def _harmonic_interpolated_field(
     wx,
     wy,
@@ -812,6 +850,21 @@ def _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolu
 
 
 def _selected_boundary_field_binary_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    solids = getattr(boundary_object, "BoundaryRegionSolids", None)
+    if solids:
+        inside = np.zeros(wx.shape, dtype=bool)
+        for solid in solids:
+            solid_adapter = _BoundaryShapeAdapter(solid)
+            inside |= _selected_boundary_field_binary_vtk(
+                solid_adapter,
+                wx,
+                wy,
+                wz,
+                sampling,
+                fallback_resolution,
+            ) > 0.0
+        return np.where(inside, 1.0, -1.0)
+
     surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
     points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
     inside = _classify_points(surface, points)
@@ -832,6 +885,35 @@ def _implicit_distances(surface, points):
     return np.asarray(sampled["implicit_distance"], dtype=float)
 
 
+def _selected_boundary_distance_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    solids = getattr(boundary_object, "BoundaryRegionSolids", None)
+    if solids:
+        field = None
+        for solid in solids:
+            solid_adapter = _BoundaryShapeAdapter(solid)
+            solid_field = _selected_boundary_distance_vtk(
+                solid_adapter,
+                wx,
+                wy,
+                wz,
+                sampling,
+                fallback_resolution,
+            )
+            field = solid_field if field is None else np.minimum(field, solid_field)
+        if field is not None:
+            return field
+
+    cache_key = _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, "distance")
+    if cache_key is not None and cache_key in _BOUNDARY_FIELD_CACHE:
+        return _BOUNDARY_FIELD_CACHE[cache_key].copy()
+
+    surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
+    distance = np.abs(_implicit_distances(surface, points)).reshape(wx.shape, order="C")
+    _store_boundary_field_cache(cache_key, distance)
+    return distance
+
+
 def _boundary_shell_mask(inside):
     mask = np.zeros(inside.shape, dtype=bool)
     for axis in range(3):
@@ -846,6 +928,23 @@ def _boundary_shell_mask(inside):
 
 
 def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    solids = getattr(boundary_object, "BoundaryRegionSolids", None)
+    if solids:
+        field = None
+        for solid in solids:
+            solid_adapter = _BoundaryShapeAdapter(solid)
+            solid_field = _selected_boundary_field_signed_vtk(
+                solid_adapter,
+                wx,
+                wy,
+                wz,
+                sampling,
+                fallback_resolution,
+            )
+            field = solid_field if field is None else np.maximum(field, solid_field)
+        if field is not None:
+            return field
+
     cache_key = _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, "signed")
     if cache_key is not None and cache_key in _BOUNDARY_FIELD_CACHE:
         return _BOUNDARY_FIELD_CACHE[cache_key].copy()
@@ -867,6 +966,15 @@ def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, f
         field[shell] = -signed_distance
     _store_boundary_field_cache(cache_key, field)
     return field
+
+
+class _BoundaryShapeAdapter:
+    TypeId = "TPMS::BoundaryRegionSolid"
+
+    def __init__(self, shape):
+        self.Shape = shape
+        self.Placement = App.Placement()
+        self.ForceTessellatedBoundary = True
 
 
 def _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, mode):
@@ -974,6 +1082,8 @@ def _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling=0.0):
 
 
 def _analytic_boundary_field(boundary_object, wx, wy, wz):
+    if bool(getattr(boundary_object, "ForceTessellatedBoundary", False)):
+        return None
     type_id = getattr(boundary_object, "TypeId", "")
     placement = getattr(boundary_object, "Placement", None)
     if placement is None:
@@ -1009,16 +1119,13 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
     if hasattr(boundary_object, "Shape"):
         sphere_shell = _spherical_shell_from_shape(boundary_object.Shape)
         if sphere_shell is not None:
-            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
-            return _spherical_shell_field(lx, ly, lz, *sphere_shell)
+            return _spherical_shell_field(wx, wy, wz, *sphere_shell)
         conical_shell = _conical_inner_cylindrical_shell_from_shape(boundary_object.Shape)
         if conical_shell is not None:
-            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
-            return _conical_inner_cylindrical_shell_field(lx, ly, lz, *conical_shell)
+            return _conical_inner_cylindrical_shell_field(wx, wy, wz, *conical_shell)
         shell = _cylindrical_shell_from_shape(boundary_object.Shape)
         if shell is not None:
-            lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
-            return _cylindrical_shell_field(lx, ly, lz, *shell)
+            return _cylindrical_shell_field(wx, wy, wz, *shell)
 
     return None
 
@@ -1460,6 +1567,7 @@ def generate_polydata(
     density_offset_value=0.3,
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    equation_blend_controls=None,
     grading_resolution=16,
     harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
@@ -1489,6 +1597,7 @@ def generate_polydata(
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
         field = np.full(x.shape, float(field))
+    field = _blend_equation_field(field, x, y, z, wx, wy, wz, equation_blend_controls)
 
     if offset_field.shape != field.shape:
         offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
@@ -1520,6 +1629,179 @@ def generate_polydata(
     raise ValueError("Unsupported TPMS part: {}".format(part))
 
 
+def generate_hybrid_polydata(
+    equation,
+    part=PART_SHEET,
+    cell_size=(1.0, 1.0, 1.0),
+    repeat_cell=(1, 1, 1),
+    resolution=32,
+    offset=0.3,
+    phase=(0.0, 0.0, 0.0),
+    boundary_mode=BOUNDARY_SELECTED_SOLID,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
+    origin=None,
+    origin_rotation=None,
+    base_density=1.0,
+    region_specs=None,
+    transition_controls=None,
+    transition_region_specs=None,
+):
+    configure_vtk_smp()
+    region_specs = list(region_specs or [])
+    transition_controls = list(transition_controls or [])
+    transition_region_specs = list(transition_region_specs or [])
+    grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
+        cell_size,
+        repeat_cell,
+        resolution,
+        phase,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        origin,
+        origin_rotation,
+        "Uniform",
+        base_density,
+        None,
+        DENSITY_COUNT_FOLLOW,
+        GRADIENT_FACE_DISTANCE,
+        "Uniform",
+        offset,
+        None,
+        GRADIENT_FACE_DISTANCE,
+        0,
+        HARMONIC_BOUNDARY_CONDUCTOR,
+    )
+
+    field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
+    if field.shape == ():
+        field = np.full(x.shape, float(field))
+    offset_field = np.full(field.shape, float(offset), dtype=float)
+    region_index = np.full(field.shape, -1, dtype=np.int32)
+    base_density = max(0.05, float(base_density))
+
+    fallback_resolution = max(wx.shape)
+    def boundary_mask(boundary):
+        try:
+            return _selected_boundary_field_signed_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) >= 0.0
+        except Exception:
+            return _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
+
+    def boundary_distance(boundary):
+        try:
+            return _selected_boundary_distance_vtk(boundary, wx, wy, wz, sampling, fallback_resolution)
+        except Exception:
+            mask = _selected_boundary_field_binary_vtk(boundary, wx, wy, wz, sampling, fallback_resolution) > 0.0
+            return np.where(mask, 0.0, np.inf)
+
+    def evaluated_field(spec, equation_key="equation", density_key="base_density"):
+        density = max(0.05, float(spec.get(density_key, base_density)))
+        scale = density / base_density
+        values = np.asarray(evaluate_equation(str(spec.get(equation_key, equation)), x * scale, y * scale, z * scale), dtype=float)
+        if values.shape == ():
+            values = np.full(field.shape, float(values))
+        return values
+
+    for spec in region_specs:
+        boundary = spec.get("boundary_object")
+        if boundary is None:
+            continue
+        mask = boundary_mask(boundary)
+        if not np.any(mask):
+            continue
+        spec_field = evaluated_field(spec)
+        if spec_field.shape == field.shape:
+            field[mask] = spec_field[mask]
+        offset_field[mask] = float(spec.get("offset", offset))
+        region_index[mask] = int(spec.get("index", -1))
+
+    for spec in transition_region_specs:
+        boundary = spec.get("boundary_object")
+        source_boundary = spec.get("source_boundary_object")
+        target_boundary = spec.get("target_boundary_object")
+        if boundary is None or source_boundary is None or target_boundary is None:
+            continue
+        mask = boundary_mask(boundary)
+        if not np.any(mask):
+            continue
+        source_field = evaluated_field(spec, "source_equation", "source_base_density")
+        target_field = evaluated_field(spec, "target_equation", "target_base_density")
+        if source_field.shape != field.shape or target_field.shape != field.shape:
+            continue
+        source_distance = boundary_distance(source_boundary)
+        target_distance = boundary_distance(target_boundary)
+        denom = source_distance + target_distance
+        t = np.divide(
+            source_distance,
+            denom,
+            out=np.full(field.shape, 0.5, dtype=float),
+            where=np.isfinite(denom) & (denom > 1e-12),
+        )
+        t = _smoothstep(np.clip(t, 0.0, 1.0))
+        field[mask] = ((1.0 - t) * source_field + t * target_field)[mask]
+        source_offset = float(spec.get("source_offset", offset))
+        target_offset = float(spec.get("target_offset", offset))
+        offset_field[mask] = ((1.0 - t) * source_offset + t * target_offset)[mask]
+        region_index[mask] = int(spec.get("index", -1))
+
+    for control in transition_controls:
+        source_index = int(control.get("source_index", -999999))
+        target_equation = str(control.get("target_equation", "")).strip()
+        if not target_equation:
+            continue
+        mask = region_index == source_index
+        if not np.any(mask):
+            continue
+        try:
+            distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            weight = _smooth_falloff_weight(distance, max(1e-9, float(control.get("transition", 1.0))))
+            weight = np.where(mask, weight, 0.0)
+            if not np.any(weight > 0.0):
+                continue
+            density = max(0.05, float(control.get("target_density", base_density)))
+            scale = density / base_density
+            target = np.asarray(evaluate_equation(target_equation, x * scale, y * scale, z * scale), dtype=float)
+            if target.shape == ():
+                target = np.full(field.shape, float(target))
+            if target.shape != field.shape:
+                continue
+            field = field + weight * (target - field)
+            if "target_offset" in control:
+                offset_field = offset_field + weight * (float(control["target_offset"]) - offset_field)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring hybrid TPMS transition control: {}\n".format(exc))
+
+    grid["surface"] = field.ravel(order="F")
+    grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
+    grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
+    has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
+
+    if not add_caps:
+        return _generate_uncapped_polydata(grid, part, has_boundary)
+    if part == PART_SHEET:
+        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
+            scalars="lower_surface",
+            invert=False,
+        )
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_UPPER:
+        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_LOWER:
+        volume = grid.clip_scalar(scalars="lower_surface")
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_SURFACE:
+        volume = grid.contour(isosurfaces=[0.0], scalars="surface")
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface().clean().triangulate()
+    raise ValueError("Unsupported TPMS part: {}".format(part))
+
+
 def generate_cylindrical_ring_polydata(
     equation,
     part=PART_SHEET,
@@ -1543,6 +1825,7 @@ def generate_cylindrical_ring_polydata(
     density_offset_value=0.3,
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    equation_blend_controls=None,
     boundary_mode=BOUNDARY_BOX,
     boundary_object=None,
     sampling=0.0,
@@ -1552,7 +1835,9 @@ def generate_cylindrical_ring_polydata(
     configure_vtk_smp()
     cell_size = np.asarray(cell_size, dtype=float)
     phase = np.asarray(phase, dtype=float)
-    origin = np.asarray(origin if origin is not None else (0.0, 0.0, 0.0), dtype=float)
+    if origin is None:
+        origin = _default_origin(boundary_mode, boundary_object)
+    origin = np.asarray(origin, dtype=float)
 
     inner_radius = max(float(ring_radius), 1e-9)
     outer_radius = max(float(ring_outer_radius), inner_radius + 1e-9)
@@ -1638,6 +1923,7 @@ def generate_cylindrical_ring_polydata(
     field = np.asarray(evaluate_equation(equation, kx * px, ky * py, kz * pz), dtype=float)
     if field.shape == ():
         field = np.full(u.shape, float(field))
+    field = _blend_equation_field(field, kx * px, ky * py, kz * pz, wx, wy, wz, equation_blend_controls)
     if offset_field.shape != field.shape:
         offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
 
@@ -2031,6 +2317,7 @@ def generate_freecad_mesh(
     density_offset_value=0.3,
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    equation_blend_controls=None,
     coordinate_mode=COORDINATE_CARTESIAN,
     ring_radius=25.0,
     ring_outer_radius=35.0,
@@ -2066,6 +2353,7 @@ def generate_freecad_mesh(
             density_offset_value,
             density_offset_controls,
             density_offset_gradient,
+            equation_blend_controls,
             boundary_mode=boundary_mode,
             boundary_object=boundary_object,
             sampling=sampling,
@@ -2105,6 +2393,7 @@ def generate_freecad_mesh(
             density_offset_value,
             density_offset_controls,
             density_offset_gradient,
+            equation_blend_controls,
             grading_resolution,
             harmonic_boundary_condition,
         )
@@ -2141,6 +2430,7 @@ def generate_freecad_mesh(
             density_offset_value,
             density_offset_controls,
             density_offset_gradient,
+            equation_blend_controls,
             grading_resolution,
             harmonic_boundary_condition,
         )
@@ -2177,6 +2467,7 @@ def generate_freecad_mesh(
         density_offset_value,
         density_offset_controls,
         density_offset_gradient,
+        equation_blend_controls,
         grading_resolution,
         harmonic_boundary_condition,
     )
@@ -2210,6 +2501,58 @@ def generate_freecad_mesh(
     except Exception:
         pass
     return combined
+
+
+def generate_hybrid_freecad_mesh(
+    equation,
+    part=PART_SHEET,
+    cell_size=(10.0, 10.0, 10.0),
+    repeat_cell=(1, 1, 1),
+    resolution=16,
+    offset=0.3,
+    phase=(0.0, 0.0, 0.0),
+    boundary_mode=BOUNDARY_SELECTED_SOLID,
+    boundary_object=None,
+    sampling=0.0,
+    add_caps=True,
+    mesh_relaxation=False,
+    relax_iterations=5,
+    relax_skip_boundary=True,
+    relax_cap_surface=False,
+    origin=None,
+    origin_rotation=None,
+    base_density=1.0,
+    region_specs=None,
+    transition_controls=None,
+    transition_region_specs=None,
+):
+    polydata = generate_hybrid_polydata(
+        equation,
+        part,
+        cell_size,
+        repeat_cell,
+        resolution,
+        offset,
+        phase,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        add_caps,
+        origin,
+        origin_rotation,
+        base_density,
+        region_specs,
+        transition_controls,
+        transition_region_specs,
+    )
+    return _prepare_freecad_mesh(
+        polydata,
+        mesh_relaxation,
+        relax_iterations,
+        relax_skip_boundary,
+        relax_cap_surface,
+        add_caps,
+    )
 
 
 def add_tpms_mesh_to_document(

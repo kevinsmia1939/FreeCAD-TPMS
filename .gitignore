@@ -3,7 +3,6 @@ __pycache__/
 *.py[cod]
 
 # FreeCAD generated documents and backups
-*.FCStd
 *.FCBak
 *.FCStd1
 
