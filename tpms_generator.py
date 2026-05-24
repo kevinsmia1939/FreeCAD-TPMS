@@ -542,6 +542,39 @@ def _smooth_falloff_weight(distance, transition):
     return 1.0 - smooth
 
 
+def _blend_equation_field(base_field, x, y, z, wx, wy, wz, equation_blend_controls=None):
+    field = np.asarray(base_field, dtype=float)
+    for control in equation_blend_controls or []:
+        equation = str(control.get("equation", "")).strip()
+        if not equation:
+            continue
+        try:
+            target = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
+            if target.shape == ():
+                target = np.full(field.shape, float(target), dtype=float)
+            if target.shape != field.shape:
+                continue
+            if control.get("type") == "face_distance":
+                distance = np.abs(_face_distance_field(wx, wy, wz, control))
+            else:
+                point = np.asarray(control["point"], dtype=float)
+                normal = np.asarray(control["normal"], dtype=float)
+                normal_length = float(np.linalg.norm(normal))
+                if normal_length <= 1e-12:
+                    continue
+                normal = normal / normal_length
+                distance = np.abs(
+                    (wx - point[0]) * normal[0]
+                    + (wy - point[1]) * normal[1]
+                    + (wz - point[2]) * normal[2]
+                )
+            weight = _smooth_falloff_weight(distance, max(1e-9, float(control.get("transition", 1.0))))
+            field = field + weight * (target - field)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring TPMS equation blend control: {}\n".format(exc))
+    return field
+
+
 def _harmonic_interpolated_field(
     wx,
     wy,
@@ -1503,6 +1536,7 @@ def generate_polydata(
     density_offset_value=0.3,
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    equation_blend_controls=None,
     grading_resolution=16,
     harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
 ):
@@ -1532,6 +1566,7 @@ def generate_polydata(
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
         field = np.full(x.shape, float(field))
+    field = _blend_equation_field(field, x, y, z, wx, wy, wz, equation_blend_controls)
 
     if offset_field.shape != field.shape:
         offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
@@ -1586,6 +1621,7 @@ def generate_cylindrical_ring_polydata(
     density_offset_value=0.3,
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    equation_blend_controls=None,
     boundary_mode=BOUNDARY_BOX,
     boundary_object=None,
     sampling=0.0,
@@ -1681,6 +1717,7 @@ def generate_cylindrical_ring_polydata(
     field = np.asarray(evaluate_equation(equation, kx * px, ky * py, kz * pz), dtype=float)
     if field.shape == ():
         field = np.full(u.shape, float(field))
+    field = _blend_equation_field(field, kx * px, ky * py, kz * pz, wx, wy, wz, equation_blend_controls)
     if offset_field.shape != field.shape:
         offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
 
@@ -2074,6 +2111,7 @@ def generate_freecad_mesh(
     density_offset_value=0.3,
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
+    equation_blend_controls=None,
     coordinate_mode=COORDINATE_CARTESIAN,
     ring_radius=25.0,
     ring_outer_radius=35.0,
@@ -2109,6 +2147,7 @@ def generate_freecad_mesh(
             density_offset_value,
             density_offset_controls,
             density_offset_gradient,
+            equation_blend_controls,
             boundary_mode=boundary_mode,
             boundary_object=boundary_object,
             sampling=sampling,
@@ -2148,6 +2187,7 @@ def generate_freecad_mesh(
             density_offset_value,
             density_offset_controls,
             density_offset_gradient,
+            equation_blend_controls,
             grading_resolution,
             harmonic_boundary_condition,
         )
@@ -2184,6 +2224,7 @@ def generate_freecad_mesh(
             density_offset_value,
             density_offset_controls,
             density_offset_gradient,
+            equation_blend_controls,
             grading_resolution,
             harmonic_boundary_condition,
         )
@@ -2220,6 +2261,7 @@ def generate_freecad_mesh(
         density_offset_value,
         density_offset_controls,
         density_offset_gradient,
+        equation_blend_controls,
         grading_resolution,
         harmonic_boundary_condition,
     )

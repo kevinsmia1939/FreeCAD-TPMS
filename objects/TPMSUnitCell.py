@@ -585,7 +585,7 @@ class TPMSUnitCell:
             origin_rotation = _origin_rotation(obj)
             unit_cell_controls = _unit_cell_controls(obj)
             density_offset_controls = _density_offset_controls(obj)
-            transition_unit_cell_controls, transition_offset_controls, transition_gradient = _transition_controls(obj)
+            transition_unit_cell_controls, transition_offset_controls, transition_equation_controls, transition_gradient = _transition_controls(obj)
             if transition_unit_cell_controls:
                 unit_cell_controls = list(unit_cell_controls) + transition_unit_cell_controls
             if transition_offset_controls:
@@ -593,9 +593,11 @@ class TPMSUnitCell:
             effective_base_density = max(0.05, float(getattr(obj, "BaseDensity", 1.0)))
             effective_offset = float(getattr(obj, "Offset", 0.3))
             transition_source = _transition_endpoint_controller(obj, "source")
-            if (transition_unit_cell_controls or transition_offset_controls) and transition_source is not None:
+            effective_equation = str(getattr(obj, "Equation", ""))
+            if (transition_unit_cell_controls or transition_offset_controls or transition_equation_controls) and transition_source is not None:
                 effective_base_density = max(0.05, float(getattr(transition_source, "BaseDensity", effective_base_density)))
                 effective_offset = float(getattr(transition_source, "Offset", effective_offset))
+                effective_equation = str(getattr(transition_source, "Equation", effective_equation))
             boundary_object, region_description, region_count = selected_boundary_region(obj)
             obj.RegionCount = int(region_count)
             obj.RegionDescription = region_description
@@ -607,7 +609,7 @@ class TPMSUnitCell:
                 obj.LastError = ""
                 return
             mesh = tpms_generator.generate_freecad_mesh(
-                obj.Equation,
+                effective_equation,
                 str(obj.Part),
                 cell_size,
                 repeat_cell,
@@ -634,6 +636,7 @@ class TPMSUnitCell:
                 effective_offset,
                 density_offset_controls,
                 transition_gradient if transition_offset_controls else str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                transition_equation_controls,
                 str(getattr(obj, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
                 max(1e-9, float(getattr(obj, "RingRadius", 25.0))),
                 max(1e-9, float(getattr(obj, "RingOuterRadius", float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))))),
@@ -1262,18 +1265,18 @@ def _transition_controls(obj):
     import tpms_generator
 
     if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
-        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
     mode = str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE))
     if mode == TRANSITION_MODE_NONE:
-        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
     if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE:
-        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
 
     items = boundary_region_items(getattr(obj, "BoundaryObject", None))
     selected_index = int(getattr(obj, "RegionIndex", 0))
     selected_solid = _region_solid_from_items(items, selected_index)
     if selected_solid is None:
-        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+        return [], [], [], tpms_generator.GRADIENT_FACE_DISTANCE
 
     source_index = int(getattr(obj, "TransitionSourceRegion", selected_index))
     target_index = int(getattr(obj, "TransitionTargetRegion", 0))
@@ -1293,35 +1296,41 @@ def _transition_controls(obj):
 
     density_controls = []
     offset_controls = []
+    equation_controls = []
     if mode == TRANSITION_MODE_BRIDGE_REGION:
         if source_solid is not None:
-            density, offset = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
+            density, offset, equation = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
             density_controls.extend(density)
             offset_controls.extend(offset)
+            equation_controls.extend(equation)
         if target_solid is not None:
-            density, offset = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
+            density, offset, equation = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
             density_controls.extend(density)
             offset_controls.extend(offset)
-        return density_controls, offset_controls, tpms_generator.GRADIENT_HARMONIC
+            equation_controls.extend(equation)
+        return density_controls, offset_controls, equation_controls, tpms_generator.GRADIENT_HARMONIC
 
     # Shared-face mode creates a local transition band near the face shared by
     # the selected region and the opposite endpoint region.
     if selected_index == source_index and target_solid is not None:
-        density, offset = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
+        density, offset, equation = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
         density_controls.extend(density)
         offset_controls.extend(offset)
+        equation_controls.extend(equation)
     elif selected_index == target_index and source_solid is not None:
-        density, offset = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
+        density, offset, equation = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
         density_controls.extend(density)
         offset_controls.extend(offset)
+        equation_controls.extend(equation)
     else:
         for other_solid, setting in ((source_solid, source_setting), (target_solid, target_setting)):
             if other_solid is None:
                 continue
-            density, offset = _transition_controls_for_touching_faces(selected_solid, other_solid, setting, width)
+            density, offset, equation = _transition_controls_for_touching_faces(selected_solid, other_solid, setting, width)
             density_controls.extend(density)
             offset_controls.extend(offset)
-    return density_controls, offset_controls, tpms_generator.GRADIENT_FACE_DISTANCE
+            equation_controls.extend(equation)
+    return density_controls, offset_controls, equation_controls, tpms_generator.GRADIENT_FACE_DISTANCE
 
 
 def _region_solid_from_items(items, region_index):
@@ -1334,6 +1343,7 @@ def _region_solid_from_items(items, region_index):
 def _transition_controls_for_touching_faces(solid, other_solid, setting, transition_width):
     density_controls = []
     offset_controls = []
+    equation_controls = []
     for face in _faces_touching_solid(solid, other_solid):
         try:
             point, normal = _face_point_normal(face)
@@ -1361,7 +1371,19 @@ def _transition_controls_for_touching_faces(solid, other_solid, setting, transit
                 "surface": surface,
             }
         )
-    return density_controls, offset_controls
+        equation = str(getattr(setting, "Equation", "")).strip()
+        if equation:
+            equation_controls.append(
+                {
+                    "type": "face_distance",
+                    "point": point,
+                    "normal": normal,
+                    "equation": equation,
+                    "transition": float(transition_width),
+                    "surface": surface,
+                }
+            )
+    return density_controls, offset_controls, equation_controls
 
 
 def _faces_touching_solid(solid, other_solid):

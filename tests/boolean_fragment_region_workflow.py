@@ -125,8 +125,8 @@ def run_file(path):
             transition_controller.Resolution = 37
             target_controller.BaseDensity = 1.8
             target_controller.Offset = 0.8
-            transition_density, transition_offset, _transition_gradient = _transition_controls(transition_controller)
-            transition_control_count = len(transition_density) + len(transition_offset)
+            transition_density, transition_offset, transition_equation, _transition_gradient = _transition_controls(transition_controller)
+            transition_control_count = len(transition_density) + len(transition_offset) + len(transition_equation)
             if transition_control_count <= 0:
                 raise RuntimeError("{} transition controller did not detect a shared-face transition".format(path))
         doc.recompute()
