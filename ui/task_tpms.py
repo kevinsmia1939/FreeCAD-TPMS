@@ -259,6 +259,10 @@ class TPMSTaskPanel:
         self.boundary_method.setWordWrap(True)
         status_group.addRow("Boundary method", self.boundary_method)
 
+        self.region_status = QtWidgets.QLabel(self._region_status_text())
+        self.region_status.setWordWrap(True)
+        status_group.addRow("Region", self.region_status)
+
         self.result = QtWidgets.QLabel(self._result_text())
         status_group.addRow("Result", self.result)
 
@@ -376,6 +380,12 @@ class TPMSTaskPanel:
             int(getattr(self.obj, "FacetCount", 0)),
             bool(getattr(self.obj, "IsSolidMesh", False)),
             bool(getattr(self.obj, "HasNonManifolds", False)),
+        )
+
+    def _region_status_text(self):
+        return "{}; count={}".format(
+            str(getattr(self.obj, "RegionDescription", "No region data")),
+            int(getattr(self.obj, "RegionCount", 0)),
         )
 
     def _boundary_text(self):
@@ -580,6 +590,8 @@ class TPMSTaskPanel:
             self.region_index.setCurrentIndex(max(0, min(current, len(items) - 1)))
         if not multi_region:
             self.region_mode.setCurrentText("All regions")
+        if hasattr(self, "region_status"):
+            self.region_status.setText(self._region_status_text())
 
     def _update_coordinate_controls(self):
         ring_mode = self.coordinate_mode.currentText() == self.generator.COORDINATE_CYLINDRICAL_RING
@@ -705,6 +717,7 @@ class TPMSTaskPanel:
         else:
             doc.commitTransaction()
         self.boundary_method.setText(self._boundary_method_text())
+        self.region_status.setText(self._region_status_text())
         self.result.setText(self._result_text())
 
     def _add_selected_grading_controls(self):

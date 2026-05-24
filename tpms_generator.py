@@ -812,6 +812,21 @@ def _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolu
 
 
 def _selected_boundary_field_binary_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    solids = getattr(boundary_object, "BoundaryRegionSolids", None)
+    if solids:
+        inside = np.zeros(wx.shape, dtype=bool)
+        for solid in solids:
+            solid_adapter = _BoundaryShapeAdapter(solid)
+            inside |= _selected_boundary_field_binary_vtk(
+                solid_adapter,
+                wx,
+                wy,
+                wz,
+                sampling,
+                fallback_resolution,
+            ) > 0.0
+        return np.where(inside, 1.0, -1.0)
+
     surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
     points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
     inside = _classify_points(surface, points)
@@ -846,6 +861,23 @@ def _boundary_shell_mask(inside):
 
 
 def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    solids = getattr(boundary_object, "BoundaryRegionSolids", None)
+    if solids:
+        field = None
+        for solid in solids:
+            solid_adapter = _BoundaryShapeAdapter(solid)
+            solid_field = _selected_boundary_field_signed_vtk(
+                solid_adapter,
+                wx,
+                wy,
+                wz,
+                sampling,
+                fallback_resolution,
+            )
+            field = solid_field if field is None else np.maximum(field, solid_field)
+        if field is not None:
+            return field
+
     cache_key = _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, "signed")
     if cache_key is not None and cache_key in _BOUNDARY_FIELD_CACHE:
         return _BOUNDARY_FIELD_CACHE[cache_key].copy()
@@ -867,6 +899,15 @@ def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, f
         field[shell] = -signed_distance
     _store_boundary_field_cache(cache_key, field)
     return field
+
+
+class _BoundaryShapeAdapter:
+    TypeId = "TPMS::BoundaryRegionSolid"
+
+    def __init__(self, shape):
+        self.Shape = shape
+        self.Placement = App.Placement()
+        self.ForceTessellatedBoundary = True
 
 
 def _boundary_field_cache_key(boundary_object, wx, wy, wz, sampling, fallback_resolution, mode):

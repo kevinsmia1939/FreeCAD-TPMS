@@ -80,6 +80,39 @@ def add_tpms_region_settings(source_controller):
 
     doc = source_controller.Document
     container = _container_for(source_controller)
+    controller, mesh_obj = _make_region_controller(doc, container)
+    _copy_tpms_settings(source_controller, controller)
+    _configure_region_controller(source_controller, controller, _next_region_index(source_controller))
+    return controller, mesh_obj
+
+
+def add_tpms_region_settings_for_all_regions(source_controller, skip_existing=True):
+    if not is_tpms_unit_cell(source_controller):
+        raise ValueError("Select a TPMS Parameters object first.")
+
+    items = boundary_region_items(getattr(source_controller, "BoundaryObject", None))
+    if not items:
+        raise ValueError("The selected TPMS boundary has no solid regions.")
+
+    existing = set()
+    if skip_existing:
+        existing = _existing_region_indices(source_controller)
+
+    doc = source_controller.Document
+    container = _container_for(source_controller)
+    created = []
+    for item in items:
+        index = int(item["index"])
+        if index in existing:
+            continue
+        controller, mesh_obj = _make_region_controller(doc, container)
+        _copy_tpms_settings(source_controller, controller)
+        _configure_region_controller(source_controller, controller, index)
+        created.append((controller, mesh_obj))
+    return created
+
+
+def _make_region_controller(doc, container):
     controller = doc.addObject("Part::FeaturePython", "TPMS_Region_Parameters")
     controller.Label = "TPMS Region Parameters"
     TPMSUnitCell(controller)
@@ -94,11 +127,17 @@ def add_tpms_region_settings(source_controller):
         container.addObject(controller)
         container.addObject(mesh_obj)
     controller.ResultMesh = mesh_obj
-
-    _copy_tpms_settings(source_controller, controller)
-    controller.RegionMode = REGION_MODE_SINGLE
-    controller.RegionIndex = _next_region_index(source_controller)
     return controller, mesh_obj
+
+
+def _configure_region_controller(source_controller, controller, region_index):
+    controller.RegionMode = REGION_MODE_SINGLE
+    controller.RegionIndex = int(region_index)
+    controller.RegionDescription = _region_label_for_index(getattr(source_controller, "BoundaryObject", None), region_index)
+    controller.Label = "TPMS Region {}".format(int(region_index) + 1)
+    mesh_obj = getattr(controller, "ResultMesh", None)
+    if mesh_obj is not None:
+        mesh_obj.Label = "TPMS Mesh Region {}".format(int(region_index) + 1)
 
 
 def _copy_tpms_settings(source, target):
@@ -160,6 +199,14 @@ def _next_region_index(source_controller):
     items = boundary_region_items(getattr(source_controller, "BoundaryObject", None))
     if not items:
         return 0
+    used = _existing_region_indices(source_controller)
+    for item in items:
+        if item["index"] not in used:
+            return item["index"]
+    return items[-1]["index"]
+
+
+def _existing_region_indices(source_controller):
     used = set()
     container = _container_for(source_controller)
     for obj in getattr(source_controller.Document, "Objects", []):
@@ -171,10 +218,15 @@ def _next_region_index(source_controller):
             continue
         if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE:
             used.add(int(getattr(obj, "RegionIndex", 0)))
-    for item in items:
-        if item["index"] not in used:
-            return item["index"]
-    return items[-1]["index"]
+    return used
+
+
+def _region_label_for_index(boundary_object, region_index):
+    index = int(region_index)
+    for item in boundary_region_items(boundary_object):
+        if int(item["index"]) == index:
+            return item["label"]
+    return "Region {}".format(index + 1)
 
 
 class TPMSUnitCell:
@@ -489,12 +541,14 @@ def is_tpms_unit_cell(obj):
 class _ShapeBoundaryAdapter:
     TypeId = "TPMS::BoundaryRegion"
 
-    def __init__(self, shape, label):
+    def __init__(self, shape, label, region_solids=None):
         self.Shape = shape
         self.Label = label
         self.Name = label
         self.Placement = App.Placement()
         self.ForceTessellatedBoundary = True
+        if region_solids is not None:
+            self.BoundaryRegionSolids = list(region_solids)
 
 
 def boundary_region_solids(boundary_object):
@@ -547,7 +601,15 @@ def selected_boundary_region(controller):
     items = boundary_region_items(boundary)
     if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE or len(items) <= 1:
         if len(items) > 1:
-            return _ShapeBoundaryAdapter(boundary.Shape, "All {} regions".format(len(items))), "All {} regions".format(len(items)), len(items)
+            return (
+                _ShapeBoundaryAdapter(
+                    boundary.Shape,
+                    "All {} regions".format(len(items)),
+                    [item["solid"] for item in items],
+                ),
+                "All {} regions".format(len(items)),
+                len(items),
+            )
         if len(items) == 1:
             return _ShapeBoundaryAdapter(items[0]["solid"], "Region 1"), "Region 1", 1
         return boundary, "No solid regions detected", 0
