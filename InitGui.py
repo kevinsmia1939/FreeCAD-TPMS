@@ -17,11 +17,13 @@ class TPMSGeneratorWorkbench(Workbench):
         import commands.CmdGenerateTPMS
         import commands.CmdAddTPMSRegion
         import commands.CmdAddAllTPMSRegions
+        import commands.CmdRefreshTPMS
 
         tool_list = [
             "TPMSGenerator_GenerateUnitCell",
             "TPMSGenerator_AddRegionSettings",
             "TPMSGenerator_AddAllRegionSettings",
+            "TPMSGenerator_Refresh",
         ]
         self.appendToolbar("TPMS Generator", tool_list)
         self.appendMenu("&TPMS Generator", tool_list)
