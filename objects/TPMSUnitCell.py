@@ -161,7 +161,6 @@ def _copy_tpms_settings(source, target):
         "Surface",
         "Equation",
         "Part",
-        "Resolution",
         "RepeatX",
         "RepeatY",
         "RepeatZ",
@@ -254,6 +253,81 @@ def _region_setting_indices(controller, roles=None):
         if str(getattr(obj, "RegionRole", REGION_ROLE_OVERRIDE)) in roles:
             indices.add(int(getattr(obj, "RegionIndex", 0)))
     return indices
+
+
+def _base_controller_for(controller):
+    container = _container_for(controller)
+    boundary = getattr(controller, "BoundaryObject", None)
+    fallback = None
+    for obj in getattr(controller.Document, "Objects", []):
+        if not is_tpms_unit_cell(obj):
+            continue
+        if container is not None and _container_for(obj) != container:
+            continue
+        if getattr(obj, "BoundaryObject", None) != boundary:
+            continue
+        if obj is controller:
+            fallback = obj
+        if (
+            str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_BASE
+            and str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_ALL
+        ):
+            return obj
+    return fallback or controller
+
+
+def _region_controller_for(controller, region_index, roles=None):
+    container = _container_for(controller)
+    boundary = getattr(controller, "BoundaryObject", None)
+    roles = set(roles or (REGION_ROLE_OVERRIDE, REGION_ROLE_TRANSITION))
+    for obj in getattr(controller.Document, "Objects", []):
+        if obj is controller or not is_tpms_unit_cell(obj):
+            continue
+        if container is not None and _container_for(obj) != container:
+            continue
+        if getattr(obj, "BoundaryObject", None) != boundary:
+            continue
+        if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE:
+            continue
+        if int(getattr(obj, "RegionIndex", -1)) != int(region_index):
+            continue
+        if str(getattr(obj, "RegionRole", REGION_ROLE_OVERRIDE)) in roles:
+            return obj
+    return None
+
+
+def _effective_resolution(controller):
+    base = _base_controller_for(controller)
+    if base is not controller:
+        resolution = max(4, int(getattr(base, "Resolution", getattr(controller, "Resolution", 16))))
+        try:
+            controller.Resolution = resolution
+        except Exception:
+            pass
+        return resolution
+    return max(4, int(getattr(controller, "Resolution", 16)))
+
+
+def _sync_region_resolutions_from_base(base_controller):
+    if str(getattr(base_controller, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_BASE:
+        return
+    resolution = max(4, int(getattr(base_controller, "Resolution", 16)))
+    container = _container_for(base_controller)
+    boundary = getattr(base_controller, "BoundaryObject", None)
+    for obj in getattr(base_controller.Document, "Objects", []):
+        if obj is base_controller or not is_tpms_unit_cell(obj):
+            continue
+        if container is not None and _container_for(obj) != container:
+            continue
+        if getattr(obj, "BoundaryObject", None) != boundary:
+            continue
+        if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_BASE:
+            continue
+        try:
+            obj.Resolution = resolution
+            obj.touch()
+        except Exception:
+            pass
 
 
 def _region_label_for_index(boundary_object, region_index):
@@ -475,6 +549,7 @@ class TPMSUnitCell:
                 obj.setEditorMode(prop, 2)
         if region_role_added and str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE:
             obj.RegionRole = REGION_ROLE_OVERRIDE
+        _sync_resolution_editor_mode(obj)
 
     def onDocumentRestored(self, obj):
         self._add_properties(obj)
@@ -487,6 +562,10 @@ class TPMSUnitCell:
                 obj.Equation = tpms_generator.SURFACE_EQUATIONS[str(obj.Surface)]
             except Exception:
                 pass
+        if prop in ("RegionRole", "RegionMode"):
+            _sync_resolution_editor_mode(obj)
+        if prop == "Resolution" and str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_BASE:
+            _sync_region_resolutions_from_base(obj)
 
     def execute(self, obj):
         import tpms_generator
@@ -498,7 +577,7 @@ class TPMSUnitCell:
             obj.ResultMesh = mesh_obj
 
         try:
-            resolution = max(4, int(obj.Resolution))
+            resolution = _effective_resolution(obj)
             repeat_cell = (1, 1, 1)
             cell_size = _vector_tuple(obj.CellSize, fallback=(10.0, 10.0, 10.0), minimum=1e-9)
             phase = _vector_tuple(obj.Phase, fallback=(0.0, 0.0, 0.0), minimum=None)
@@ -506,6 +585,17 @@ class TPMSUnitCell:
             origin_rotation = _origin_rotation(obj)
             unit_cell_controls = _unit_cell_controls(obj)
             density_offset_controls = _density_offset_controls(obj)
+            transition_unit_cell_controls, transition_offset_controls, transition_gradient = _transition_controls(obj)
+            if transition_unit_cell_controls:
+                unit_cell_controls = list(unit_cell_controls) + transition_unit_cell_controls
+            if transition_offset_controls:
+                density_offset_controls = list(density_offset_controls) + transition_offset_controls
+            effective_base_density = max(0.05, float(getattr(obj, "BaseDensity", 1.0)))
+            effective_offset = float(getattr(obj, "Offset", 0.3))
+            transition_source = _transition_endpoint_controller(obj, "source")
+            if (transition_unit_cell_controls or transition_offset_controls) and transition_source is not None:
+                effective_base_density = max(0.05, float(getattr(transition_source, "BaseDensity", effective_base_density)))
+                effective_offset = float(getattr(transition_source, "Offset", effective_offset))
             boundary_object, region_description, region_count = selected_boundary_region(obj)
             obj.RegionCount = int(region_count)
             obj.RegionDescription = region_description
@@ -535,15 +625,15 @@ class TPMSUnitCell:
                 bool(getattr(obj, "RelaxCapSurface", False)),
                 origin,
                 origin_rotation,
-                str(getattr(obj, "DensityMode", "Uniform")),
-                max(0.05, float(getattr(obj, "BaseDensity", 1.0))),
+                "Non-uniform" if transition_unit_cell_controls else str(getattr(obj, "DensityMode", "Uniform")),
+                effective_base_density,
                 unit_cell_controls,
                 str(getattr(obj, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW)),
-                str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
-                str(getattr(obj, "DensityOffsetMode", "Uniform")),
-                float(getattr(obj, "Offset", 0.3)),
+                transition_gradient if transition_unit_cell_controls else str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                "Non-uniform" if transition_offset_controls else str(getattr(obj, "DensityOffsetMode", "Uniform")),
+                effective_offset,
                 density_offset_controls,
-                str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
+                transition_gradient if transition_offset_controls else str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
                 str(getattr(obj, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
                 max(1e-9, float(getattr(obj, "RingRadius", 25.0))),
                 max(1e-9, float(getattr(obj, "RingOuterRadius", float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))))),
@@ -1152,6 +1242,160 @@ def _density_offset_controls(obj):
                 }
             )
     return controls
+
+
+def _transition_endpoint_controller(obj, side):
+    if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
+        return None
+    if str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE)) == TRANSITION_MODE_NONE:
+        return None
+    if side == "source":
+        index = int(getattr(obj, "TransitionSourceRegion", 0))
+    else:
+        index = int(getattr(obj, "TransitionTargetRegion", 0))
+    if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) == REGION_MODE_SINGLE and index == int(getattr(obj, "RegionIndex", -1)):
+        return obj
+    return _region_controller_for(obj, index) or _base_controller_for(obj)
+
+
+def _transition_controls(obj):
+    import tpms_generator
+
+    if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) != REGION_ROLE_TRANSITION:
+        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+    mode = str(getattr(obj, "TransitionMode", TRANSITION_MODE_NONE))
+    if mode == TRANSITION_MODE_NONE:
+        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+    if str(getattr(obj, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE:
+        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+
+    items = boundary_region_items(getattr(obj, "BoundaryObject", None))
+    selected_index = int(getattr(obj, "RegionIndex", 0))
+    selected_solid = _region_solid_from_items(items, selected_index)
+    if selected_solid is None:
+        return [], [], tpms_generator.GRADIENT_FACE_DISTANCE
+
+    source_index = int(getattr(obj, "TransitionSourceRegion", selected_index))
+    target_index = int(getattr(obj, "TransitionTargetRegion", 0))
+    source_solid = _region_solid_from_items(items, source_index)
+    target_solid = _region_solid_from_items(items, target_index)
+    source_setting = _transition_endpoint_controller(obj, "source") or obj
+    target_setting = _transition_endpoint_controller(obj, "target") or _base_controller_for(obj)
+
+    width = float(getattr(obj, "TransitionWidth", 0.0))
+    if width <= 0.0:
+        width = max(
+            float(getattr(obj, "DensityTransition", 0.0)),
+            float(getattr(obj, "DensityOffsetTransition", 0.0)),
+            min(_vector_tuple(getattr(obj, "CellSize", App.Vector(10.0, 10.0, 10.0)), (10.0, 10.0, 10.0), 1e-9)) * 0.5,
+        )
+    width = max(width, 1e-9)
+
+    density_controls = []
+    offset_controls = []
+    if mode == TRANSITION_MODE_BRIDGE_REGION:
+        if source_solid is not None:
+            density, offset = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
+            density_controls.extend(density)
+            offset_controls.extend(offset)
+        if target_solid is not None:
+            density, offset = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
+            density_controls.extend(density)
+            offset_controls.extend(offset)
+        return density_controls, offset_controls, tpms_generator.GRADIENT_HARMONIC
+
+    # Shared-face mode creates a local transition band near the face shared by
+    # the selected region and the opposite endpoint region.
+    if selected_index == source_index and target_solid is not None:
+        density, offset = _transition_controls_for_touching_faces(selected_solid, target_solid, target_setting, width)
+        density_controls.extend(density)
+        offset_controls.extend(offset)
+    elif selected_index == target_index and source_solid is not None:
+        density, offset = _transition_controls_for_touching_faces(selected_solid, source_solid, source_setting, width)
+        density_controls.extend(density)
+        offset_controls.extend(offset)
+    else:
+        for other_solid, setting in ((source_solid, source_setting), (target_solid, target_setting)):
+            if other_solid is None:
+                continue
+            density, offset = _transition_controls_for_touching_faces(selected_solid, other_solid, setting, width)
+            density_controls.extend(density)
+            offset_controls.extend(offset)
+    return density_controls, offset_controls, tpms_generator.GRADIENT_FACE_DISTANCE
+
+
+def _region_solid_from_items(items, region_index):
+    for item in items:
+        if int(item["index"]) == int(region_index):
+            return item["solid"]
+    return None
+
+
+def _transition_controls_for_touching_faces(solid, other_solid, setting, transition_width):
+    density_controls = []
+    offset_controls = []
+    for face in _faces_touching_solid(solid, other_solid):
+        try:
+            point, normal = _face_point_normal(face)
+            surface = _face_surface_mesh(face)
+        except Exception as exc:
+            App.Console.PrintWarning("Ignoring transition face: {}\n".format(exc))
+            continue
+        density_controls.append(
+            {
+                "type": "face_distance",
+                "point": point,
+                "normal": normal,
+                "density": max(0.05, float(getattr(setting, "BaseDensity", 1.0))),
+                "transition": float(transition_width),
+                "surface": surface,
+            }
+        )
+        offset_controls.append(
+            {
+                "type": "face_distance",
+                "point": point,
+                "normal": normal,
+                "offset": float(getattr(setting, "Offset", 0.3)),
+                "transition": float(transition_width),
+                "surface": surface,
+            }
+        )
+    return density_controls, offset_controls
+
+
+def _faces_touching_solid(solid, other_solid):
+    if solid is None or other_solid is None:
+        return []
+    tolerance = _shape_tolerance(solid)
+    faces = []
+    for face in getattr(solid, "Faces", []):
+        try:
+            distance = float(face.distToShape(other_solid)[0])
+        except Exception:
+            continue
+        if distance <= tolerance:
+            faces.append(face)
+    return faces
+
+
+def _shape_tolerance(shape):
+    try:
+        bb = shape.BoundBox
+        diagonal = (float(bb.XLength) ** 2 + float(bb.YLength) ** 2 + float(bb.ZLength) ** 2) ** 0.5
+    except Exception:
+        diagonal = 1.0
+    return max(diagonal * 1e-6, 1e-6)
+
+
+def _sync_resolution_editor_mode(obj):
+    if not hasattr(obj, "Resolution"):
+        return
+    try:
+        mode = 0 if str(getattr(obj, "RegionRole", REGION_ROLE_BASE)) == REGION_ROLE_BASE else 1
+        obj.setEditorMode("Resolution", mode)
+    except Exception:
+        pass
 
 
 def _face_point_normal(face):

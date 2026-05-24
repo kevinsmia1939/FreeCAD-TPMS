@@ -622,6 +622,7 @@ class TPMSTaskPanel:
         self.region_mode.setEnabled(multi_region)
         self.region_index.setEnabled(multi_region and self.region_mode.currentText() == "Single region")
         self.base_excludes.setEnabled(self.region_role.currentText() == "Base")
+        self.resolution.setEnabled(self.region_role.currentText() == "Base")
         if items:
             self.region_index.setCurrentIndex(max(0, min(current, len(items) - 1)))
         if not multi_region:
@@ -900,7 +901,8 @@ class TPMSTaskPanel:
             obj.Surface = self.surface.currentText()
             obj.Equation = self.equation.text()
             obj.Part = self.part.currentText()
-            obj.Resolution = int(self.resolution.value())
+            if self.region_role.currentText() == "Base":
+                obj.Resolution = int(self.resolution.value())
             obj.RepeatX = 1
             obj.RepeatY = 1
             obj.RepeatZ = 1

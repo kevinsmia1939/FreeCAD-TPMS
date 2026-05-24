@@ -24,6 +24,7 @@ from objects.TPMSUnitCell import (
     boundary_region_items,
     is_tpms_unit_cell,
     make_tpms_unit_cell,
+    _transition_controls,
 )
 
 
@@ -102,6 +103,32 @@ def run_file(path):
         controller = _main_controller(doc, boundary)
         _configure_fast(controller, boundary)
         created = add_tpms_region_settings_for_all_regions(controller, skip_existing=True)
+        controllers_before_recompute = [
+            obj
+            for obj in doc.Objects
+            if is_tpms_unit_cell(obj) and getattr(obj, "BoundaryObject", None) == boundary
+        ]
+        region_settings_before_recompute = [
+            obj
+            for obj in controllers_before_recompute
+            if str(getattr(obj, "RegionMode", "")) == "Single region"
+        ]
+        transition_control_count = 0
+        if os.path.basename(path) == "boolean_fragment_density_grading.FCStd" and len(region_settings_before_recompute) >= 2:
+            transition_controller = region_settings_before_recompute[0]
+            target_controller = region_settings_before_recompute[1]
+            transition_controller.RegionRole = REGION_ROLE_TRANSITION
+            transition_controller.TransitionMode = "Shared face"
+            transition_controller.TransitionSourceRegion = int(getattr(transition_controller, "RegionIndex", 0))
+            transition_controller.TransitionTargetRegion = int(getattr(target_controller, "RegionIndex", 0))
+            transition_controller.TransitionWidth = 5.0
+            transition_controller.Resolution = 37
+            target_controller.BaseDensity = 1.8
+            target_controller.Offset = 0.8
+            transition_density, transition_offset, _transition_gradient = _transition_controls(transition_controller)
+            transition_control_count = len(transition_density) + len(transition_offset)
+            if transition_control_count <= 0:
+                raise RuntimeError("{} transition controller did not detect a shared-face transition".format(path))
         doc.recompute()
 
         controllers = [
@@ -138,6 +165,14 @@ def run_file(path):
             )
             if facets <= 0 and not base_can_be_empty:
                 raise RuntimeError("{} generated an empty mesh".format(obj.Label))
+            if _role(obj) != REGION_ROLE_BASE and int(getattr(obj, "Resolution", 0)) != int(controller.Resolution):
+                raise RuntimeError(
+                    "{} kept an independent resolution {} instead of base {}".format(
+                        obj.Label,
+                        int(getattr(obj, "Resolution", 0)),
+                        int(controller.Resolution),
+                    )
+                )
 
         covered_regions = {
             int(getattr(obj, "RegionIndex", 0))
@@ -161,10 +196,11 @@ def run_file(path):
 
         override_facets = sum(_mesh_facet_count(obj) for obj in single_region)
         print(
-            "PASS {} regions={} created={} main_facets={} override_facets={} main_region='{}' main_bounds={}".format(
+            "PASS {} regions={} created={} transition_controls={} main_facets={} override_facets={} main_region='{}' main_bounds={}".format(
                 os.path.basename(path),
                 len(regions),
                 len(created),
+                transition_control_count,
                 _mesh_facet_count(controller),
                 override_facets,
                 base_description,
