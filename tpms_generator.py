@@ -40,6 +40,8 @@ GRADIENT_FACE_PLANE = "Face plane"
 GRADIENT_HARMONIC = "Harmonic field"
 HARMONIC_BOUNDARY_CONDUCTOR = "Conductor"
 HARMONIC_BOUNDARY_INSULATOR = "Insulator"
+TRANSITION_BLEND_THRESHOLD = "Threshold interval blend"
+TRANSITION_BLEND_SIGNED_FIELD = "Morphological signed-field blend"
 
 _BOUNDARY_FIELD_CACHE = {}
 _BOUNDARY_FIELD_CACHE_ORDER = []
@@ -113,6 +115,15 @@ def coordinate_modes():
 def _make_axis(minimum, maximum, default_count):
     count = max(2, int(default_count))
     return np.linspace(float(minimum), float(maximum), count)
+
+
+def _make_aligned_axis(minimum, maximum, spacing, anchor=0.0):
+    spacing = max(float(spacing), 1e-12)
+    anchor = float(anchor)
+    lower = anchor + math.floor((float(minimum) - anchor) / spacing) * spacing
+    upper = anchor + math.ceil((float(maximum) - anchor) / spacing) * spacing
+    count = max(1, int(round((upper - lower) / spacing)))
+    return lower + spacing * np.arange(count + 1, dtype=float)
 
 
 def _rectilinear_axes(wx, wy, wz):
@@ -197,7 +208,7 @@ def _make_grid(
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     cell_size = np.asarray(cell_size, dtype=float)
     repeat_cell = np.asarray(repeat_cell, dtype=int)
@@ -207,11 +218,13 @@ def _make_grid(
     if origin is None:
         origin = _default_origin(boundary_mode, boundary_object)
     phase_origin = np.asarray(origin, dtype=float)
+    aligned_spacing = None
 
     if boundary_mode == BOUNDARY_SELECTED_SOLID:
         bounds = _shape_bounds(boundary_object)
         fallback_spacing = min(float(value) / max(int(resolution), 1) for value in cell_size)
         spacing = max(fallback_spacing, 1e-9)
+        aligned_spacing = spacing
         if _needs_curved_analytic_padding(boundary_object):
             bounds = [(axis_min - spacing, axis_max + spacing) for axis_min, axis_max in bounds]
         default_counts = [
@@ -226,9 +239,17 @@ def _make_grid(
     if sampling and sampling > 0.0:
         lengths = [max(bounds[i][1] - bounds[i][0], 1e-9) for i in range(3)]
         spacing = max(lengths) / max(float(sampling), 1.0)
+        aligned_spacing = max(spacing, 1e-9)
         default_counts = [int(math.ceil(length / spacing)) + 1 for length in lengths]
 
-    coords = [_make_axis(bounds[i][0], bounds[i][1], default_counts[i]) for i in range(3)]
+    if aligned_spacing is not None:
+        coords = [
+            _make_aligned_axis(bounds[i][0], bounds[i][1], aligned_spacing, phase_origin[i])
+            for i in range(3)
+        ]
+        default_counts = [len(axis) for axis in coords]
+    else:
+        coords = [_make_axis(bounds[i][0], bounds[i][1], default_counts[i]) for i in range(3)]
     wx, wy, wz = np.meshgrid(*coords, indexing="ij")
     spacing = tuple(
         float(coords[i][1] - coords[i][0]) if len(coords[i]) > 1 else 1.0
@@ -369,7 +390,7 @@ def _offset_field(
     boundary_object=None,
     sampling=0.0,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     offset = np.full(wx.shape, float(base_offset), dtype=float)
     if str(density_offset_mode) != "Non-uniform" or not density_offset_controls:
@@ -439,7 +460,7 @@ def _apply_offset_controls_to_field(
     boundary_object=None,
     sampling=0.0,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     offset = np.asarray(offset, dtype=float)
     if str(density_offset_mode) != "Non-uniform" or not density_offset_controls:
@@ -507,7 +528,7 @@ def _density_phase_coordinates(
     boundary_object=None,
     sampling=0.0,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     base = max(0.05, float(base_density))
     px = base * (tx + phase[0])
@@ -670,7 +691,7 @@ def _harmonic_interpolated_field(
     value_key,
     minimum=0.0,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     axes = _rectilinear_axes(wx, wy, wz)
     coarse_axes = _coarse_axes_for_harmonic(axes, grading_resolution) if axes is not None else None
@@ -1198,9 +1219,6 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
         sphere_shell = _spherical_shell_from_shape(boundary_object.Shape)
         if sphere_shell is not None:
             return _spherical_shell_field(wx, wy, wz, *sphere_shell)
-        conical_shell = _conical_inner_cylindrical_shell_from_shape(boundary_object.Shape)
-        if conical_shell is not None:
-            return _conical_inner_cylindrical_shell_field(wx, wy, wz, *conical_shell)
         shell = _cylindrical_shell_from_shape(boundary_object.Shape)
         if shell is not None:
             return _cylindrical_shell_field(wx, wy, wz, *shell)
@@ -1285,94 +1303,6 @@ def _cylindrical_shell_from_shape(shape):
     return tuple(center), tuple(axis), outer_radius, inner_radius, hmin, hmax
 
 
-def _conical_inner_cylindrical_shell_from_shape(shape):
-    if shape is None or shape.isNull():
-        return None
-
-    cylinders = []
-    cones = []
-    for face in shape.Faces:
-        surface = face.Surface
-        surface_type = type(surface).__name__
-        if surface_type == "Plane":
-            continue
-        try:
-            umin, umax, _vmin, _vmax = face.ParameterRange
-        except Exception:
-            return None
-        if abs(abs(float(umax) - float(umin)) - 2.0 * math.pi) > 1e-5:
-            return None
-        if surface_type == "Cylinder" and hasattr(surface, "Radius"):
-            axis = _unit_array(surface.Axis)
-            if axis is None:
-                return None
-            cylinders.append((float(surface.Radius), _vector_array(surface.Center), axis))
-        elif surface_type == "Cone" and hasattr(surface, "Radius") and hasattr(surface, "SemiAngle"):
-            axis = _unit_array(surface.Axis)
-            if axis is None:
-                return None
-            cones.append(
-                (
-                    float(surface.Radius),
-                    float(surface.SemiAngle),
-                    _vector_array(surface.Center),
-                    axis,
-                )
-            )
-        else:
-            return None
-
-    if len(cylinders) != 1 or len(cones) != 1:
-        return None
-
-    outer_radius, center, axis = cylinders[0]
-    cone_radius, cone_angle, cone_center, cone_axis = cones[0]
-    if outer_radius <= 1e-9:
-        return None
-    if abs(abs(float(np.dot(axis, cone_axis))) - 1.0) > 1e-6:
-        return None
-    tolerance = max(outer_radius * 1e-6, 1e-7)
-    offset = cone_center - center
-    radial_offset = offset - np.dot(offset, axis) * axis
-    if float(np.linalg.norm(radial_offset)) > tolerance:
-        return None
-
-    projections = []
-    for vertex in shape.Vertexes:
-        point = _vector_array(vertex.Point)
-        projections.append(float(np.dot(point - center, axis)))
-    if not projections:
-        return None
-    hmin = min(projections)
-    hmax = max(projections)
-    if hmax - hmin <= 1e-9:
-        return None
-
-    slope = math.tan(float(cone_angle))
-    test_inner = _conical_radius_at_axial(
-        np.array((hmin, hmax), dtype=float),
-        center,
-        axis,
-        cone_center,
-        cone_axis,
-        cone_radius,
-        slope,
-    )
-    if np.any(test_inner < -tolerance) or np.any(test_inner >= outer_radius - tolerance):
-        return None
-    return (
-        tuple(center),
-        tuple(axis),
-        float(outer_radius),
-        float(hmin),
-        float(hmax),
-        tuple(cone_center),
-        tuple(cone_axis),
-        float(cone_radius),
-        float(slope),
-    )
-
-
 def _spherical_shell_from_shape(shape):
     if shape is None or shape.isNull():
         return None
@@ -1434,69 +1364,6 @@ def _cylindrical_shell_field(px, py, pz, center, axis, outer_radius, inner_radiu
 
     inner_radius = max(0.0, float(inner_radius))
     outer_radius = max(inner_radius + 1e-12, float(outer_radius))
-    lower = float(hmin)
-    upper = float(hmax)
-
-    inside_distance = np.minimum.reduce(
-        (
-            radial - inner_radius,
-            outer_radius - radial,
-            axial - lower,
-            upper - axial,
-        )
-    )
-    radial_outside = np.maximum(inner_radius - radial, 0.0) + np.maximum(radial - outer_radius, 0.0)
-    axial_outside = np.maximum(lower - axial, 0.0) + np.maximum(axial - upper, 0.0)
-    outside = np.sqrt(radial_outside * radial_outside + axial_outside * axial_outside)
-    return np.where(inside_distance >= 0.0, inside_distance, -outside)
-
-
-def _conical_radius_at_axial(axial, center, axis, cone_center, cone_axis, cone_radius, slope):
-    center = np.asarray(center, dtype=float)
-    axis = np.asarray(axis, dtype=float)
-    cone_center = np.asarray(cone_center, dtype=float)
-    cone_axis = np.asarray(cone_axis, dtype=float)
-    origin_projection = float(np.dot(center - cone_center, cone_axis))
-    axis_projection = float(np.dot(axis, cone_axis))
-    cone_axial = origin_projection + np.asarray(axial, dtype=float) * axis_projection
-    return float(cone_radius) + cone_axial * float(slope)
-
-
-def _conical_inner_cylindrical_shell_field(
-    px,
-    py,
-    pz,
-    center,
-    axis,
-    outer_radius,
-    hmin,
-    hmax,
-    cone_center,
-    cone_axis,
-    cone_radius,
-    cone_slope,
-):
-    center = np.asarray(center, dtype=float)
-    axis = np.asarray(axis, dtype=float)
-    axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
-
-    dx = px - center[0]
-    dy = py - center[1]
-    dz = pz - center[2]
-    axial = dx * axis[0] + dy * axis[1] + dz * axis[2]
-    radial_sq = dx * dx + dy * dy + dz * dz - axial * axial
-    radial = np.sqrt(np.maximum(radial_sq, 0.0))
-
-    inner_radius = _conical_radius_at_axial(
-        axial,
-        center,
-        axis,
-        cone_center,
-        np.asarray(cone_axis, dtype=float) / max(float(np.linalg.norm(cone_axis)), 1e-12),
-        cone_radius,
-        cone_slope,
-    )
-    outer_radius = max(float(outer_radius), 1e-12)
     lower = float(hmin)
     upper = float(hmax)
 
@@ -1647,7 +1514,7 @@ def generate_polydata(
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     equation_blend_controls=None,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     configure_vtk_smp()
     grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
@@ -1733,7 +1600,7 @@ def generate_hybrid_polydata(
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     configure_vtk_smp()
     region_specs = list(region_specs or [])
@@ -1815,6 +1682,45 @@ def generate_hybrid_polydata(
         if str(part_name) == PART_SURFACE:
             return -np.abs(values)
         return np.minimum(half_offset - values, values + half_offset)
+
+    def interval_bounds_for_part(values, offset_values, part_name):
+        offset_values = np.asarray(offset_values, dtype=float)
+        half_offset = 0.5 * offset_values
+        values = np.asarray(values, dtype=float)
+        limit = max(
+            float(np.nanmax(np.abs(values))) if values.size else 1.0,
+            float(np.nanmax(np.abs(offset_values))) if offset_values.size else 1.0,
+            1.0,
+        ) + 1.0
+        part_name = str(part_name)
+        if part_name == PART_UPPER:
+            return half_offset, np.full(field.shape, limit, dtype=float)
+        if part_name == PART_LOWER:
+            return np.full(field.shape, -limit, dtype=float), -half_offset
+        if part_name == PART_SHEET:
+            return -half_offset, half_offset
+        return None, None
+
+    def transition_material_from_parts(
+        source_values,
+        target_values,
+        offset_values,
+        blend_weight,
+        source_part,
+        target_part,
+        source_surface="",
+        target_surface="",
+    ):
+        if str(source_surface) in (SURFACE_EMPTY, SURFACE_SOLID_FILL) or str(target_surface) in (SURFACE_EMPTY, SURFACE_SOLID_FILL):
+            return None
+        source_lower, source_upper = interval_bounds_for_part(source_values, offset_values, source_part)
+        target_lower, target_upper = interval_bounds_for_part(target_values, offset_values, target_part)
+        if source_lower is None or target_lower is None:
+            return None
+        blend_values = (1.0 - blend_weight) * source_values + blend_weight * target_values
+        lower = (1.0 - blend_weight) * source_lower + blend_weight * target_lower
+        upper = (1.0 - blend_weight) * source_upper + blend_weight * target_upper
+        return np.minimum(blend_values - lower, upper - blend_values)
 
     def material_for_spec(spec, equation_key="equation", density_key="base_density", offset_key="offset", part_key="part", surface_key="surface"):
         surface_mode = str(spec.get(surface_key, spec.get("surface", "")))
@@ -1976,7 +1882,26 @@ def generate_hybrid_polydata(
             where=np.isfinite(denom) & (denom > 1e-12),
         )
         t = _smoothstep(np.clip(t, 0.0, 1.0))
-        material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
+        blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+        source_part = str(spec.get("source_part", part))
+        target_part = str(spec.get("target_part", part))
+        if blend_mode == TRANSITION_BLEND_SIGNED_FIELD:
+            material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
+        else:
+            part_transition_material = transition_material_from_parts(
+                source_field,
+                target_field,
+                offset_field,
+                t,
+                source_part,
+                target_part,
+                str(spec.get("source_surface", "")),
+                str(spec.get("target_surface", "")),
+            )
+            if part_transition_material is not None:
+                material_field[mask] = part_transition_material[mask]
+            else:
+                material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
 
     grid["surface"] = field.ravel(order="F")
     grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
@@ -1987,10 +1912,12 @@ def generate_hybrid_polydata(
     if not add_caps:
         surface = grid.contour(isosurfaces=[0.0], scalars="material")
         surface = _apply_boundary_clip(surface, has_boundary)
-        return surface.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    volume = grid.clip_scalar(scalars="material", value=0.0, invert=False)
-    volume = _apply_boundary_clip(volume, has_boundary)
-    return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+        surface = surface.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    else:
+        volume = grid.clip_scalar(scalars="material", value=0.0, invert=False)
+        volume = _apply_boundary_clip(volume, has_boundary)
+        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    return surface
 
 
 def generate_cylindrical_ring_polydata(
@@ -2003,8 +1930,8 @@ def generate_cylindrical_ring_polydata(
     add_caps=True,
     origin=None,
     origin_rotation=None,
-    ring_radius=25.0,
-    ring_outer_radius=35.0,
+    ring_radius=2.0,
+    ring_outer_radius=5.0,
     ring_height=10.0,
     ring_angular_cells=8,
     density_mode="Uniform",
@@ -2021,7 +1948,7 @@ def generate_cylindrical_ring_polydata(
     boundary_object=None,
     sampling=0.0,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     configure_vtk_smp()
     cell_size = np.asarray(cell_size, dtype=float)
@@ -2036,21 +1963,24 @@ def generate_cylindrical_ring_polydata(
     radius = inner_radius + 0.5 * radial_thickness
     height = max(float(ring_height), 1e-9)
     angular_cells = max(1, int(ring_angular_cells))
-    circumference = 2.0 * math.pi * radius
-    angular_cell_size = circumference / float(angular_cells)
+    period = float(cell_size[0]) * float(angular_cells)
+    angular_cell_size = max(float(cell_size[0]), 1e-9)
     radial_cell_size = max(float(cell_size[1]), 1e-9)
     height_cell_size = max(float(cell_size[2]), 1e-9)
+    radial_spacing = radial_cell_size / max(int(resolution), 1)
+    height_spacing = height_cell_size / max(int(resolution), 1)
 
     nu = int(resolution) * angular_cells + 1
-    nv = max(3, int(math.ceil(radial_thickness / radial_cell_size * int(resolution))) + 1)
-    nw = max(3, int(math.ceil(height / height_cell_size * int(resolution))) + 1)
 
-    u_coords = _make_axis(0.0, circumference, nu)
-    v_coords = _make_axis(-0.5 * radial_thickness, 0.5 * radial_thickness, nv)
-    h_coords = _make_axis(0.0, height, nw)
+    u_coords = _make_axis(0.0, period, nu)
+    radial_coords = _make_aligned_axis(inner_radius, outer_radius, radial_spacing, 0.0)
+    h_coords = _make_aligned_axis(0.0, height, height_spacing, 0.0)
+    v_coords = radial_coords - radius
+    nv = len(v_coords)
+    nw = len(h_coords)
     u, v, h = np.meshgrid(u_coords, v_coords, h_coords, indexing="ij")
 
-    local_x, local_y, local_z = _cylindrical_ring_local_arrays(u, v, h, radius, circumference)
+    local_x, local_y, local_z = _cylindrical_ring_local_arrays(u, v, h, radius, period)
     rotation_matrix = _rotation_matrix(origin_rotation)
     if rotation_matrix is not None:
         wx, wy, wz = _origin_frame_to_world_arrays(rotation_matrix, local_x, local_y, local_z, origin)
@@ -2066,7 +1996,7 @@ def generate_cylindrical_ring_polydata(
             float(v_coords[1] - v_coords[0]) if len(v_coords) > 1 else 1.0,
             float(h_coords[1] - h_coords[0]) if len(h_coords) > 1 else 1.0,
         ),
-        origin=(0.0, -0.5 * radial_thickness, 0.0),
+        origin=(0.0, float(v_coords[0]), float(h_coords[0])),
     )
 
     ring_cell_size = (angular_cell_size, radial_cell_size, height_cell_size)
@@ -2093,8 +2023,9 @@ def generate_cylindrical_ring_polydata(
             grading_resolution=0,
             harmonic_boundary_condition=harmonic_boundary_condition,
         )
+    radial_position = radius + v
     px = u + phase[0]
-    py = (v + phase[1]) * density
+    py = (radial_position + phase[1]) * density
     pz = (h + phase[2]) * density
     offset_field = _offset_field(
         wx,
@@ -2118,10 +2049,11 @@ def generate_cylindrical_ring_polydata(
     if offset_field.shape != field.shape:
         offset_field = np.full(field.shape, float(density_offset_value), dtype=float)
 
+    radial_position = radius + v
     boundary = np.minimum.reduce(
         (
-            v + 0.5 * radial_thickness,
-            0.5 * radial_thickness - v,
+            radial_position - inner_radius,
+            outer_radius - radial_position,
             h,
             height - h,
         )
@@ -2156,9 +2088,9 @@ def generate_cylindrical_ring_polydata(
     else:
         raise ValueError("Unsupported TPMS part: {}".format(part))
 
-    surface = _remove_periodic_axis_caps(surface, circumference)
-    surface = _stitch_periodic_axis_edges(surface, circumference)
-    return _map_ring_polydata_to_world(surface, radius, circumference, origin, rotation_matrix)
+    surface = _remove_periodic_axis_caps(surface, period)
+    surface = _stitch_periodic_axis_edges(surface, period)
+    return _map_ring_polydata_to_world(surface, radius, period, origin, rotation_matrix)
 
 
 def _cylindrical_ring_local_arrays(u, v, h, radius, circumference):
@@ -2442,7 +2374,7 @@ def _cap_vertex_normals(polydata, triangles, cap):
 def _prepare_polydata(
     polydata,
     mesh_relaxation=False,
-    relax_iterations=5,
+    relax_iterations=1,
     relax_skip_boundary=True,
     relax_cap_surface=False,
 ):
@@ -2454,7 +2386,7 @@ def _prepare_polydata(
 def _prepare_freecad_mesh(
     polydata,
     mesh_relaxation=False,
-    relax_iterations=5,
+    relax_iterations=1,
     relax_skip_boundary=True,
     relax_cap_surface=False,
     require_closed=False,
@@ -2494,7 +2426,7 @@ def generate_freecad_mesh(
     sampling=0.0,
     add_caps=True,
     mesh_relaxation=False,
-    relax_iterations=5,
+    relax_iterations=1,
     relax_skip_boundary=True,
     relax_cap_surface=False,
     origin=None,
@@ -2510,12 +2442,12 @@ def generate_freecad_mesh(
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     equation_blend_controls=None,
     coordinate_mode=COORDINATE_CARTESIAN,
-    ring_radius=25.0,
-    ring_outer_radius=35.0,
+    ring_radius=2.0,
+    ring_outer_radius=5.0,
     ring_height=10.0,
     ring_angular_cells=8,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     repeat_cell = tuple(max(1, int(value)) for value in repeat_cell)
     cell_size = tuple(float(value) for value in cell_size)
@@ -2707,7 +2639,7 @@ def generate_hybrid_freecad_mesh(
     sampling=0.0,
     add_caps=True,
     mesh_relaxation=False,
-    relax_iterations=5,
+    relax_iterations=1,
     relax_skip_boundary=True,
     relax_cap_surface=False,
     origin=None,
@@ -2724,7 +2656,7 @@ def generate_hybrid_freecad_mesh(
     density_offset_controls=None,
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     grading_resolution=16,
-    harmonic_boundary_condition=HARMONIC_BOUNDARY_CONDUCTOR,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
 ):
     polydata = generate_hybrid_polydata(
         equation,
@@ -2778,7 +2710,7 @@ def add_tpms_mesh_to_document(
     sampling=0.0,
     add_caps=True,
     mesh_relaxation=False,
-    relax_iterations=5,
+    relax_iterations=1,
     relax_skip_boundary=True,
     relax_cap_surface=False,
     origin=None,

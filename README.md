@@ -59,6 +59,24 @@ Transitions are explicit: shared faces between two regions do not blend by
 themselves.  A separate transition region must be assigned source and target
 regions.
 
+### Transition Blend Modes
+
+Transition regions support two blend modes:
+
+- `Threshold interval blend`: blends the valid TPMS material interval for each
+  part type.  For example, a sheet is treated as the interval around the TPMS
+  zero surface, while upper and lower skeletal parts are treated as one-sided
+  intervals.  This is the safer choice for transitions between sheet and
+  skeletal TPMS because it avoids field cancellation that can create torn or
+  abrupt-looking meshes.
+- `Morphological signed-field blend`: blends the signed implicit material
+  fields directly.  This matches the common form `F_hybrid = w * F_target +
+  (1 - w) * F_source`.  It is useful for compatible solid fields, empty/solid
+  transitions, or similar structures.  For sheet-to-skeletal transitions,
+  direct signed-field blending can cancel near the midpoint of the transition,
+  which may create torn or abrupt-looking meshes.  In that case, choose
+  `Threshold interval blend` explicitly.
+
 ## Cylindrical Rings
 
 Set `Coordinate Mode` to `Cylindrical ring` to generate TPMS in cylindrical

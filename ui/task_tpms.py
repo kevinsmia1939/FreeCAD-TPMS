@@ -63,10 +63,10 @@ class TPMSTaskPanel:
         self.coordinate_mode.setCurrentText(str(getattr(obj, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)))
         tpms_layout.addRow("Coordinates", self.coordinate_mode)
 
-        self.ring_radius = self._double_spin(float(getattr(obj, "RingRadius", 25.0)), 0.001, 100000.0, 0.5)
+        self.ring_radius = self._double_spin(float(getattr(obj, "RingRadius", 2.0)), 0.001, 100000.0, 0.5)
         tpms_layout.addRow("Ring inner radius", self.ring_radius)
 
-        outer_radius = float(getattr(obj, "RingOuterRadius", float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))))
+        outer_radius = float(getattr(obj, "RingOuterRadius", 5.0))
         self.ring_outer_radius = self._double_spin(outer_radius, 0.001, 100000.0, 0.5)
         tpms_layout.addRow("Ring outer radius", self.ring_outer_radius)
 
@@ -117,6 +117,18 @@ class TPMSTaskPanel:
         self.transition_target = self._spin(max(0, int(getattr(obj, "TransitionTargetRegion", 0))), 0, 100000)
         transition_group.addRow("Target region", self.transition_target)
 
+        self.transition_blend_mode = QtWidgets.QComboBox()
+        self.transition_blend_mode.addItems(
+            [
+                tpms_generator.TRANSITION_BLEND_THRESHOLD,
+                tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+            ]
+        )
+        self.transition_blend_mode.setCurrentText(
+            str(getattr(obj, "TransitionBlendMode", tpms_generator.TRANSITION_BLEND_THRESHOLD))
+        )
+        transition_group.addRow("Blend mode", self.transition_blend_mode)
+
         density_group = self._group(layout, "Grading")
 
         self.density_mode = QtWidgets.QComboBox()
@@ -162,13 +174,13 @@ class TPMSTaskPanel:
             tpms_generator.HARMONIC_BOUNDARY_INSULATOR,
         ])
         harmonic_boundary_condition = str(
-            getattr(obj, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)
+            getattr(obj, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_INSULATOR)
         )
         if harmonic_boundary_condition not in (
             tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR,
             tpms_generator.HARMONIC_BOUNDARY_INSULATOR,
         ):
-            harmonic_boundary_condition = tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR
+            harmonic_boundary_condition = tpms_generator.HARMONIC_BOUNDARY_INSULATOR
         self.harmonic_boundary_condition.setCurrentText(harmonic_boundary_condition)
         density_group.addRow("Unselected faces", self.harmonic_boundary_condition)
 
@@ -258,7 +270,7 @@ class TPMSTaskPanel:
         self.mesh_relaxation.setChecked(bool(getattr(obj, "MeshRelaxation", False)))
         relaxation_group.addRow("Relax mesh", self.mesh_relaxation)
 
-        self.relax_iterations = self._spin(max(0, int(getattr(obj, "RelaxIterations", 5))), 0, 100)
+        self.relax_iterations = self._spin(max(0, int(getattr(obj, "RelaxIterations", 1))), 0, 100)
         relaxation_group.addRow("Relax iterations", self.relax_iterations)
 
         self.relax_skip_boundary = QtWidgets.QCheckBox()
@@ -386,6 +398,10 @@ class TPMSTaskPanel:
         self._set_tip(self.region_role, "Base is the first region setting. Override defines one fixed TPMS region. Transition blends source and target TPMS fields inside this region.")
         self._set_tip(self.transition_source, "Source region index for this transition region.")
         self._set_tip(self.transition_target, "Target region index for this transition region.")
+        self._set_tip(
+            self.transition_blend_mode,
+            "Threshold interval blends TPMS part thresholds. Morphological signed-field blends source and target implicit solid fields.",
+        )
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
         self._set_tip(self.density_mode, "Enable non-uniform unit-cell density grading from selected faces.")
@@ -533,8 +549,6 @@ class TPMSTaskPanel:
             return method_text("Analytical box")
         if type_id == "Part::Cylinder" and all(hasattr(boundary, name) for name in ("Radius", "Height")):
             return method_text("Analytical cylinder")
-        if self._has_conical_inner_cylindrical_boundary(boundary):
-            return method_text("Analytical tapered tube")
         cylindrical_radii = self._analytical_cylindrical_radii(boundary)
         if len(cylindrical_radii) == 1:
             return method_text("Analytical cylinder")
@@ -563,24 +577,6 @@ class TPMSTaskPanel:
                 if radius not in radii:
                     radii.append(radius)
         return radii
-
-    def _has_conical_inner_cylindrical_boundary(self, boundary):
-        shape = getattr(boundary, "Shape", None)
-        if shape is None or shape.isNull():
-            return False
-        cylinder_count = 0
-        cone_count = 0
-        for face in shape.Faces:
-            surface_type = type(face.Surface).__name__
-            if surface_type == "Plane":
-                continue
-            if surface_type == "Cylinder":
-                cylinder_count += 1
-            elif surface_type == "Cone":
-                cone_count += 1
-            else:
-                return False
-        return cylinder_count == 1 and cone_count == 1
 
     def _analytical_spherical_radii(self, boundary):
         shape = getattr(boundary, "Shape", None)
@@ -672,6 +668,7 @@ class TPMSTaskPanel:
         enabled = self.region_role.currentText() == "Transition"
         self._set_enabled(self.transition_source, enabled)
         self._set_enabled(self.transition_target, enabled)
+        self._set_enabled(self.transition_blend_mode, enabled)
         transition_role = self.region_role.currentText() == "Transition"
         for widget in (
             self.surface,
@@ -833,6 +830,7 @@ class TPMSTaskPanel:
             obj.RegionRole = self.region_role.currentText()
             obj.TransitionSourceRegion = int(self.transition_source.value())
             obj.TransitionTargetRegion = int(self.transition_target.value())
+            obj.TransitionBlendMode = self.transition_blend_mode.currentText()
             obj.Sampling = float(self.sampling.value())
             obj.AddCaps = bool(self.add_caps.isChecked())
             obj.touch()
@@ -1021,6 +1019,7 @@ class TPMSTaskPanel:
             obj.RegionRole = self.region_role.currentText()
             obj.TransitionSourceRegion = int(self.transition_source.value())
             obj.TransitionTargetRegion = int(self.transition_target.value())
+            obj.TransitionBlendMode = self.transition_blend_mode.currentText()
             obj.Sampling = float(self.sampling.value())
             obj.AddCaps = bool(self.add_caps.isChecked())
             obj.MeshRelaxation = bool(self.mesh_relaxation.isChecked())

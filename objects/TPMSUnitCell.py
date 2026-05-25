@@ -43,8 +43,8 @@ def make_tpms_unit_cell(doc=None):
     controller.CellSize = App.Vector(10.0, 10.0, 10.0)
     controller.Phase = App.Vector(0.0, 0.0, 0.0)
     controller.CoordinateMode = tpms_generator.COORDINATE_CARTESIAN
-    controller.RingRadius = 25.0
-    controller.RingOuterRadius = 35.0
+    controller.RingRadius = 2.0
+    controller.RingOuterRadius = 5.0
     controller.RingHeight = 10.0
     controller.RingAngularCells = 8
     controller.OriginMode = "Boundary object"
@@ -62,7 +62,7 @@ def make_tpms_unit_cell(doc=None):
     controller.DensityOffsetValue = 0.3
     controller.DensityOffsetTransition = 5.0
     controller.GradingResolution = 16
-    controller.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR
+    controller.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_INSULATOR
     controller.MeshStitching = False
     controller.BoundaryMode = tpms_generator.BOUNDARY_BOX
     controller.RegionMode = REGION_MODE_ALL
@@ -71,10 +71,11 @@ def make_tpms_unit_cell(doc=None):
     controller.BaseExcludesRegionSettings = True
     controller.TransitionSourceRegion = 0
     controller.TransitionTargetRegion = 0
+    controller.TransitionBlendMode = tpms_generator.TRANSITION_BLEND_THRESHOLD
     controller.Sampling = 0.0
     controller.AddCaps = True
     controller.MeshRelaxation = False
-    controller.RelaxIterations = 5
+    controller.RelaxIterations = 1
     controller.RelaxSkipBoundary = True
     controller.RelaxCapSurface = False
 
@@ -372,10 +373,10 @@ class TPMSUnitCell:
             obj.CoordinateMode = tpms_generator.COORDINATE_CARTESIAN
         if not hasattr(obj, "RingRadius"):
             obj.addProperty("App::PropertyFloat", "RingRadius", "TPMS", "Cylindrical ring inner radius")
-            obj.RingRadius = 25.0
+            obj.RingRadius = 2.0
         if not hasattr(obj, "RingOuterRadius"):
             obj.addProperty("App::PropertyFloat", "RingOuterRadius", "TPMS", "Cylindrical ring outer radius")
-            obj.RingOuterRadius = float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))
+            obj.RingOuterRadius = 5.0
         if hasattr(obj, "RingRadialThickness"):
             obj.setEditorMode("RingRadialThickness", 2)
         if not hasattr(obj, "RingHeight"):
@@ -462,7 +463,7 @@ class TPMSUnitCell:
         if not hasattr(obj, "HarmonicBoundaryCondition"):
             obj.addProperty("App::PropertyEnumeration", "HarmonicBoundaryCondition", "Grading", "How unselected boundary faces behave in harmonic grading")
             obj.HarmonicBoundaryCondition = [tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR, tpms_generator.HARMONIC_BOUNDARY_INSULATOR]
-            obj.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR
+            obj.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_INSULATOR
         if not hasattr(obj, "MeshStitching"):
             obj.addProperty("App::PropertyBool", "MeshStitching", "TPMS Array", "Stitch repeated mesh boundaries")
             obj.MeshStitching = False
@@ -496,6 +497,13 @@ class TPMSUnitCell:
         if not hasattr(obj, "TransitionTargetRegion"):
             obj.addProperty("App::PropertyInteger", "TransitionTargetRegion", "Transition", "Target region index for implicit blending")
             obj.TransitionTargetRegion = 0
+        if not hasattr(obj, "TransitionBlendMode"):
+            obj.addProperty("App::PropertyEnumeration", "TransitionBlendMode", "Transition", "How transition regions blend source and target structures")
+            obj.TransitionBlendMode = [
+                tpms_generator.TRANSITION_BLEND_THRESHOLD,
+                tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+            ]
+            obj.TransitionBlendMode = tpms_generator.TRANSITION_BLEND_THRESHOLD
         if not hasattr(obj, "RegionCount"):
             obj.addProperty("App::PropertyInteger", "RegionCount", "Result", "Detected solid region count in the boundary")
             obj.setEditorMode("RegionCount", 1)
@@ -513,7 +521,7 @@ class TPMSUnitCell:
             obj.MeshRelaxation = False
         if not hasattr(obj, "RelaxIterations"):
             obj.addProperty("App::PropertyInteger", "RelaxIterations", "Relaxation", "Lloyd-style relaxation iterations")
-            obj.RelaxIterations = 5
+            obj.RelaxIterations = 1
         if not hasattr(obj, "RelaxSkipBoundary"):
             obj.addProperty("App::PropertyBool", "RelaxSkipBoundary", "Relaxation", "Keep boundary/cap vertices fixed during relaxation")
             obj.RelaxSkipBoundary = True
@@ -630,7 +638,7 @@ class TPMSUnitCell:
                 max(0.0, float(getattr(obj, "Sampling", 0.0))),
                 bool(getattr(obj, "AddCaps", True)),
                 bool(getattr(obj, "MeshRelaxation", False)),
-                max(0, int(getattr(obj, "RelaxIterations", 5))),
+                max(0, int(getattr(obj, "RelaxIterations", 1))),
                 bool(getattr(obj, "RelaxSkipBoundary", True)),
                 bool(getattr(obj, "RelaxCapSurface", False)),
                 origin,
@@ -646,12 +654,12 @@ class TPMSUnitCell:
                 str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
                 None,
                 str(getattr(obj, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
-                max(1e-9, float(getattr(obj, "RingRadius", 25.0))),
-                max(1e-9, float(getattr(obj, "RingOuterRadius", float(getattr(obj, "RingRadius", 25.0)) + float(getattr(obj, "RingRadialThickness", 10.0))))),
+                max(1e-9, float(getattr(obj, "RingRadius", 2.0))),
+                max(1e-9, float(getattr(obj, "RingOuterRadius", 5.0))),
                 max(1e-9, float(getattr(obj, "RingHeight", 10.0))),
                 max(1, int(getattr(obj, "RingAngularCells", 8))),
                 max(0, int(getattr(obj, "GradingResolution", 16))),
-                str(getattr(obj, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
+                str(getattr(obj, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_INSULATOR)),
             )
         except Exception as exc:
             obj.LastError = str(exc)
@@ -903,7 +911,7 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         max(0.0, float(getattr(base, "Sampling", 0.0))),
         bool(getattr(base, "AddCaps", True)),
         bool(getattr(base, "MeshRelaxation", False)),
-        max(0, int(getattr(base, "RelaxIterations", 5))),
+        max(0, int(getattr(base, "RelaxIterations", 1))),
         bool(getattr(base, "RelaxSkipBoundary", True)),
         bool(getattr(base, "RelaxCapSurface", False)),
         _origin_tuple(base),
@@ -920,7 +928,7 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         density_offset_controls,
         str(getattr(base, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
         max(0, int(getattr(base, "GradingResolution", 16))),
-        str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_CONDUCTOR)),
+        str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_INSULATOR)),
     )
 
 
@@ -1002,7 +1010,7 @@ def _hybrid_transition_region_specs(base, items):
                 "target_equation": str(getattr(target_setting, "Equation", getattr(base, "Equation", ""))),
                 "target_offset": float(getattr(target_setting, "Offset", getattr(base, "Offset", 0.3))),
                 "target_base_density": max(0.05, float(getattr(target_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
-                "blend": "Implicit function blend",
+                "blend": str(getattr(setting, "TransitionBlendMode", tpms_generator.TRANSITION_BLEND_THRESHOLD)),
             }
         )
     return specs
