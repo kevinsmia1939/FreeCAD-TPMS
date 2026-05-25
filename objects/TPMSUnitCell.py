@@ -65,6 +65,7 @@ def make_tpms_unit_cell(doc=None):
     controller.HarmonicBoundaryCondition = tpms_generator.HARMONIC_BOUNDARY_INSULATOR
     controller.MeshStitching = False
     controller.BoundaryMode = tpms_generator.BOUNDARY_BOX
+    controller.BoundaryEvaluation = tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL
     controller.RegionMode = REGION_MODE_ALL
     controller.RegionIndex = 0
     controller.RegionRole = REGION_ROLE_BASE
@@ -179,6 +180,7 @@ def _copy_tpms_settings(source, target):
         "BaseDensity",
         "MeshStitching",
         "BoundaryMode",
+        "BoundaryEvaluation",
         "BoundaryObject",
         "Sampling",
         "AddCaps",
@@ -362,7 +364,7 @@ class TPMSUnitCell:
             obj.addProperty("App::PropertyInteger", "RepeatZ", "TPMS Array", "Unit cells in Z")
             obj.setEditorMode("RepeatZ", 2)
         if not hasattr(obj, "Offset"):
-            obj.addProperty("App::PropertyFloat", "Offset", "TPMS", "Sheet thickness or skeletal iso spacing")
+            obj.addProperty("App::PropertyFloat", "Offset", "TPMS", "Sheet/skeletal thickness")
         if not hasattr(obj, "CellSize"):
             obj.addProperty("App::PropertyVector", "CellSize", "TPMS", "Unit-cell size in X/Y/Z")
         if not hasattr(obj, "Phase"):
@@ -470,6 +472,15 @@ class TPMSUnitCell:
         if not hasattr(obj, "BoundaryMode"):
             obj.addProperty("App::PropertyEnumeration", "BoundaryMode", "TPMS", "Boundary used to clip the generated TPMS")
             obj.BoundaryMode = tpms_generator.boundary_modes()
+        if not hasattr(obj, "BoundaryEvaluation"):
+            obj.addProperty("App::PropertyEnumeration", "BoundaryEvaluation", "TPMS", "How selected solid boundaries are evaluated")
+        current_boundary_evaluation = str(
+            getattr(obj, "BoundaryEvaluation", tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL)
+        )
+        obj.BoundaryEvaluation = tpms_generator.boundary_evaluation_modes()
+        if current_boundary_evaluation not in tpms_generator.boundary_evaluation_modes():
+            current_boundary_evaluation = tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL
+        obj.BoundaryEvaluation = current_boundary_evaluation
         if not hasattr(obj, "BoundaryObject"):
             obj.addProperty("App::PropertyXLink", "BoundaryObject", "TPMS", "Selected solid or mesh used as boundary")
         if not hasattr(obj, "RegionMode"):
@@ -499,11 +510,19 @@ class TPMSUnitCell:
             obj.TransitionTargetRegion = 0
         if not hasattr(obj, "TransitionBlendMode"):
             obj.addProperty("App::PropertyEnumeration", "TransitionBlendMode", "Transition", "How transition regions blend source and target structures")
-            obj.TransitionBlendMode = [
-                tpms_generator.TRANSITION_BLEND_THRESHOLD,
-                tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
-            ]
-            obj.TransitionBlendMode = tpms_generator.TRANSITION_BLEND_THRESHOLD
+        current_transition_blend = str(getattr(obj, "TransitionBlendMode", tpms_generator.TRANSITION_BLEND_THRESHOLD))
+        obj.TransitionBlendMode = [
+            tpms_generator.TRANSITION_BLEND_THRESHOLD,
+            tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+        ]
+        if current_transition_blend == "Threshold interval blend":
+            current_transition_blend = tpms_generator.TRANSITION_BLEND_THRESHOLD
+        if current_transition_blend not in (
+            tpms_generator.TRANSITION_BLEND_THRESHOLD,
+            tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+        ):
+            current_transition_blend = tpms_generator.TRANSITION_BLEND_THRESHOLD
+        obj.TransitionBlendMode = current_transition_blend
         if not hasattr(obj, "RegionCount"):
             obj.addProperty("App::PropertyInteger", "RegionCount", "Result", "Detected solid region count in the boundary")
             obj.setEditorMode("RegionCount", 1)
@@ -725,6 +744,38 @@ class _ShapeBoundaryAdapter:
             self.BoundaryRegionSolids = list(region_solids)
 
 
+class _ForcedTessellatedBoundaryAdapter:
+    TypeId = "TPMS::ForcedTessellatedBoundary"
+
+    def __init__(self, boundary_object):
+        self.SourceObject = boundary_object
+        self.Label = getattr(boundary_object, "Label", getattr(boundary_object, "Name", "Selected boundary"))
+        self.Name = getattr(boundary_object, "Name", self.Label)
+        self.Placement = getattr(boundary_object, "Placement", App.Placement())
+        self.ForceTessellatedBoundary = True
+        if hasattr(boundary_object, "Shape"):
+            self.Shape = boundary_object.Shape
+        if hasattr(boundary_object, "Mesh"):
+            self.Mesh = boundary_object.Mesh
+
+
+def _force_tessellated_boundary(controller):
+    import tpms_generator
+
+    return (
+        str(getattr(controller, "BoundaryEvaluation", tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL))
+        == tpms_generator.BOUNDARY_EVALUATION_TESSELLATED_SDF
+    )
+
+
+def _boundary_for_evaluation(controller, boundary_object):
+    if boundary_object is None or not _force_tessellated_boundary(controller):
+        return boundary_object
+    if bool(getattr(boundary_object, "ForceTessellatedBoundary", False)):
+        return boundary_object
+    return _ForcedTessellatedBoundaryAdapter(boundary_object)
+
+
 def boundary_region_solids(boundary_object):
     shape = getattr(boundary_object, "Shape", None)
     if shape is None or shape.isNull():
@@ -742,8 +793,10 @@ def boundary_region_solids(boundary_object):
 
 def boundary_region_items(boundary_object):
     items = []
+    source_objects = _boolean_fragment_source_objects(boundary_object)
     for index, solid in enumerate(boundary_region_solids(boundary_object)):
         bb = solid.BoundBox
+        analytical_object = _matching_source_object_for_solid(solid, source_objects)
         try:
             center = solid.CenterOfMass
             center_text = "center {:.3f}, {:.3f}, {:.3f}".format(float(center.x), float(center.y), float(center.z))
@@ -765,6 +818,7 @@ def boundary_region_items(boundary_object):
                     float(bb.ZLength),
                 ),
                 "solid": solid,
+                "analytical_object": analytical_object,
             }
         )
     return items
@@ -774,6 +828,7 @@ def selected_boundary_region(controller):
     boundary = getattr(controller, "BoundaryObject", None)
     items = boundary_region_items(boundary)
     placement = getattr(boundary, "Placement", None)
+    force_tessellated = _force_tessellated_boundary(controller)
     if str(getattr(controller, "RegionMode", REGION_MODE_ALL)) != REGION_MODE_SINGLE or len(items) <= 1:
         if len(items) > 1:
             active_items = items
@@ -800,12 +855,59 @@ def selected_boundary_region(controller):
                 len(items),
             )
         if len(items) == 1:
-            return _ShapeBoundaryAdapter(items[0]["solid"], "Region 1", placement=placement), "Region 1", 1
-        return boundary, "No solid regions detected", 0
+            if not force_tessellated:
+                return boundary, "Region 1", 1
+            return _region_boundary_for_item(items[0], force_tessellated=True, placement=placement), "Region 1", 1
+        return _boundary_for_evaluation(controller, boundary), "No solid regions detected", 0
 
     index = max(0, min(int(getattr(controller, "RegionIndex", 0)), len(items) - 1))
     item = items[index]
-    return _ShapeBoundaryAdapter(item["solid"], item["label"], placement=placement), item["label"], len(items)
+    return _region_boundary_for_item(item, force_tessellated=force_tessellated, placement=placement), item["label"], len(items)
+
+
+def _boolean_fragment_source_objects(boundary_object):
+    if boundary_object is None:
+        return []
+    proxy = getattr(boundary_object, "Proxy", None)
+    if getattr(proxy, "Type", "") != "FeatureBooleanFragments" and type(proxy).__name__ != "FeatureBooleanFragments":
+        return []
+    return list(getattr(boundary_object, "Objects", []) or getattr(boundary_object, "Shapes", []) or [])
+
+
+def _matching_source_object_for_solid(solid, source_objects):
+    for source_object in source_objects:
+        shape = getattr(source_object, "Shape", None)
+        if shape is None or shape.isNull():
+            continue
+        source_solids = list(getattr(shape, "Solids", []) or [])
+        if len(source_solids) != 1:
+            continue
+        if _shapes_match_region_solid(source_solids[0], solid):
+            return source_object
+    return None
+
+
+def _shapes_match_region_solid(source_solid, region_solid):
+    try:
+        volume_scale = max(abs(float(source_solid.Volume)), abs(float(region_solid.Volume)), 1.0)
+        if abs(float(source_solid.Volume) - float(region_solid.Volume)) > volume_scale * 1e-6:
+            return False
+        source_bb = source_solid.BoundBox
+        region_bb = region_solid.BoundBox
+        for attr in ("XMin", "XMax", "YMin", "YMax", "ZMin", "ZMax"):
+            bound_scale = max(abs(float(getattr(source_bb, attr))), abs(float(getattr(region_bb, attr))), 1.0)
+            if abs(float(getattr(source_bb, attr)) - float(getattr(region_bb, attr))) > bound_scale * 1e-6:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _region_boundary_for_item(item, force_tessellated=False, placement=None):
+    analytical_object = item.get("analytical_object")
+    if analytical_object is not None and not force_tessellated:
+        return analytical_object
+    return _ShapeBoundaryAdapter(item["solid"], item["label"], placement=placement)
 
 
 def _is_region_setting(obj):
@@ -929,13 +1031,18 @@ def _generate_hybrid_mesh(base, items, tpms_generator):
         str(getattr(base, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE)),
         max(0, int(getattr(base, "GradingResolution", 16))),
         str(getattr(base, "HarmonicBoundaryCondition", tpms_generator.HARMONIC_BOUNDARY_INSULATOR)),
+        str(getattr(base, "CoordinateMode", tpms_generator.COORDINATE_CARTESIAN)),
+        max(1, int(getattr(base, "RingAngularCells", 8))),
     )
 
 
 def _hybrid_outer_boundary(base, items):
+    boundary = getattr(base, "BoundaryObject", None)
+    if _boolean_fragment_source_objects(boundary) and not _force_tessellated_boundary(base):
+        return boundary
     solids = [item["solid"] for item in items if item.get("solid") is not None]
     if not solids:
-        return getattr(base, "BoundaryObject", None)
+        return _boundary_for_evaluation(base, getattr(base, "BoundaryObject", None))
     try:
         fused = solids[0].multiFuse(solids[1:]) if len(solids) > 1 else solids[0]
         try:
@@ -946,7 +1053,7 @@ def _hybrid_outer_boundary(base, items):
             return _ShapeBoundaryAdapter(fused, "Outer boundary")
     except Exception as exc:
         App.Console.PrintWarning("Falling back to original multi-region boundary for caps: {}\n".format(exc))
-    return getattr(base, "BoundaryObject", None)
+    return _boundary_for_evaluation(base, getattr(base, "BoundaryObject", None))
 
 
 def _hybrid_region_specs(base, items):
@@ -960,7 +1067,7 @@ def _hybrid_region_specs(base, items):
         specs.append(
             {
                 "index": int(item["index"]),
-                "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
+                "boundary_object": _region_boundary_for_item(item, _force_tessellated_boundary(base)),
                 "surface": str(getattr(setting, "Surface", getattr(base, "Surface", "Custom"))),
                 "part": str(getattr(setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET))),
                 "equation": str(getattr(setting, "Equation", getattr(base, "Equation", ""))),
@@ -995,16 +1102,16 @@ def _hybrid_transition_region_specs(base, items):
         specs.append(
             {
                 "index": region_index,
-                "boundary_object": _ShapeBoundaryAdapter(item["solid"], item["label"]),
+                "boundary_object": _region_boundary_for_item(item, _force_tessellated_boundary(base)),
                 "source_index": source_index,
-                "source_boundary_object": _ShapeBoundaryAdapter(source_item["solid"], source_item["label"]),
+                "source_boundary_object": _region_boundary_for_item(source_item, _force_tessellated_boundary(base)),
                 "source_surface": str(getattr(source_setting, "Surface", getattr(base, "Surface", "Custom"))),
                 "source_part": str(getattr(source_setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET))),
                 "source_equation": str(getattr(source_setting, "Equation", getattr(base, "Equation", ""))),
                 "source_offset": float(getattr(source_setting, "Offset", getattr(base, "Offset", 0.3))),
                 "source_base_density": max(0.05, float(getattr(source_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
                 "target_index": target_index,
-                "target_boundary_object": _ShapeBoundaryAdapter(target_item["solid"], target_item["label"]),
+                "target_boundary_object": _region_boundary_for_item(target_item, _force_tessellated_boundary(base)),
                 "target_surface": str(getattr(target_setting, "Surface", getattr(base, "Surface", "Custom"))),
                 "target_part": str(getattr(target_setting, "Part", getattr(base, "Part", tpms_generator.PART_SHEET))),
                 "target_equation": str(getattr(target_setting, "Equation", getattr(base, "Equation", ""))),

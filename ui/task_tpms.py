@@ -38,7 +38,7 @@ class TPMSTaskPanel:
         tpms_layout.addRow("Resolution", self.resolution)
 
         self.offset = self._double_spin(float(obj.Offset), -1000.0, 1000.0, 0.05)
-        tpms_layout.addRow("Base thickness", self.offset)
+        tpms_layout.addRow("Sheet/skeletal thickness", self.offset)
 
         self.cell_x = self._double_spin(float(obj.CellSize.x), 0.001, 100000.0, 0.1)
         self.cell_y = self._double_spin(float(obj.CellSize.y), 0.001, 100000.0, 0.1)
@@ -80,6 +80,16 @@ class TPMSTaskPanel:
         self.boundary_mode.addItems(tpms_generator.boundary_modes())
         self.boundary_mode.setCurrentText(str(getattr(obj, "BoundaryMode", tpms_generator.BOUNDARY_BOX)))
         tpms_layout.addRow("Boundary", self.boundary_mode)
+
+        self.boundary_evaluation = QtWidgets.QComboBox()
+        self.boundary_evaluation.addItems(tpms_generator.boundary_evaluation_modes())
+        boundary_evaluation = str(
+            getattr(obj, "BoundaryEvaluation", tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL)
+        )
+        if boundary_evaluation not in tpms_generator.boundary_evaluation_modes():
+            boundary_evaluation = tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL
+        self.boundary_evaluation.setCurrentText(boundary_evaluation)
+        tpms_layout.addRow("Boundary evaluation", self.boundary_evaluation)
 
         self.boundary_label = QtWidgets.QLabel(self._boundary_text())
         self.boundary_select = QtWidgets.QPushButton("Use selection")
@@ -303,6 +313,7 @@ class TPMSTaskPanel:
         self.offset_density_gradient.currentTextChanged.connect(self._update_density_controls)
         self.add_grading_controls.clicked.connect(self._add_selected_grading_controls)
         self.boundary_select.clicked.connect(self._use_selected_boundary)
+        self.boundary_evaluation.currentTextChanged.connect(self._update_boundary_controls)
         self.region_mode.currentTextChanged.connect(self._update_region_controls)
         self.region_role.currentTextChanged.connect(self._update_region_controls)
         self.origin_select.clicked.connect(self._use_selected_origin)
@@ -381,7 +392,7 @@ class TPMSTaskPanel:
         self._set_tip(self.equation, "Implicit equation evaluated with x, y, and z. The zero level set defines the TPMS.")
         self._set_tip(self.part, "Sheet creates a thickened TPMS shell. Upper and Lower skeletal create one side of the implicit field.")
         self._set_tip(self.resolution, "TPMS mesh grid resolution. Higher values improve detail but increase memory and compute time.")
-        self._set_tip(self.offset, "Base sheet thickness or skeletal iso spacing. Zero and negative values are allowed.")
+        self._set_tip(self.offset, "Sheet thickness or skeletal iso spacing. For sheet TPMS this is symmetric around the TPMS mid-surface. Zero and negative values are allowed.")
         for widget in (self.cell_x, self.cell_y, self.cell_z):
             self._set_tip(widget, "TPMS unit-cell size along this local axis.")
         for widget in (self.phase_x, self.phase_y, self.phase_z):
@@ -392,6 +403,10 @@ class TPMSTaskPanel:
         self._set_tip(self.ring_height, "Height of the cylindrical ring TPMS.")
         self._set_tip(self.ring_angular_cells, "Number of TPMS periods around the full 360 degree ring.")
         self._set_tip(self.boundary_mode, "Boundary used to clip and cap the generated TPMS.")
+        self._set_tip(
+            self.boundary_evaluation,
+            "Analytical uses exact fields for recognized Part boxes, spheres, cylinders, and tubes. Tessellated SDF forces the selected boundary through mesh-based signed-distance clipping.",
+        )
         self._set_tip(self.boundary_select, "Use the currently selected solid or mesh as the TPMS boundary.")
         self._set_tip(self.region_mode, "For BooleanFragments or compounds with multiple solids, choose whether this TPMS parameter fills all regions or one solid region.")
         self._set_tip(self.region_index, "Solid region used when Boundary regions is set to Single region. Region order comes from the FreeCAD shape solids.")
@@ -400,7 +415,7 @@ class TPMSTaskPanel:
         self._set_tip(self.transition_target, "Target region index for this transition region.")
         self._set_tip(
             self.transition_blend_mode,
-            "Threshold interval blends TPMS part thresholds. Morphological signed-field blends source and target implicit solid fields.",
+            "Offset Surface Interpolation blends TPMS part thresholds. Morphological signed-field blends source and target implicit solid fields.",
         )
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
@@ -537,7 +552,14 @@ class TPMSTaskPanel:
         boundary = self._current_boundary_object()
         if boundary is None:
             return "No selected boundary"
+        if self.boundary_evaluation.currentText() == self.generator.BOUNDARY_EVALUATION_TESSELLATED_SDF:
+            if hasattr(boundary, "Shape") or hasattr(boundary, "Mesh"):
+                return method_text("Tessellation signed-distance")
         type_id = getattr(boundary, "TypeId", "")
+        if self._is_boolean_fragments_feature(boundary):
+            return method_text("Analytical BooleanFragments with tessellation fallback")
+        if type_id in ("Part::Fuse", "Part::Cut", "Part::Common", "Part::MultiFuse", "Part::MultiCommon"):
+            return method_text("Analytical CSG with tessellation fallback")
         if type_id == "Part::Sphere" and hasattr(boundary, "Radius"):
             return method_text("Analytical sphere")
         spherical_radii = self._analytical_spherical_radii(boundary)
@@ -549,6 +571,8 @@ class TPMSTaskPanel:
             return method_text("Analytical box")
         if type_id == "Part::Cylinder" and all(hasattr(boundary, name) for name in ("Radius", "Height")):
             return method_text("Analytical cylinder")
+        if self._is_basic_tube_feature(boundary):
+            return method_text("Analytical tube")
         cylindrical_radii = self._analytical_cylindrical_radii(boundary)
         if len(cylindrical_radii) == 1:
             return method_text("Analytical cylinder")
@@ -559,6 +583,22 @@ class TPMSTaskPanel:
         if hasattr(boundary, "Mesh"):
             return method_text("Tessellation signed-distance")
         return "Unsupported boundary"
+
+    def _is_boolean_fragments_feature(self, boundary):
+        if getattr(boundary, "TypeId", "") != "Part::FeaturePython":
+            return False
+        proxy = getattr(boundary, "Proxy", None)
+        if getattr(proxy, "Type", "") == "FeatureBooleanFragments":
+            return True
+        return type(proxy).__name__ == "FeatureBooleanFragments"
+
+    def _is_basic_tube_feature(self, boundary):
+        if getattr(boundary, "TypeId", "") != "Part::FeaturePython":
+            return False
+        proxy = getattr(boundary, "Proxy", None)
+        if type(proxy).__name__ != "TubeFeature":
+            return False
+        return all(hasattr(boundary, name) for name in ("InnerRadius", "OuterRadius", "Height"))
 
     def _analytical_cylindrical_radii(self, boundary):
         shape = getattr(boundary, "Shape", None)
@@ -629,6 +669,7 @@ class TPMSTaskPanel:
     def _update_boundary_controls(self):
         enabled = self.boundary_mode.currentText() == self.generator.BOUNDARY_SELECTED_SOLID
         self.boundary_mode.setEnabled(True)
+        self.boundary_evaluation.setEnabled(enabled)
         self.boundary_label.setEnabled(enabled)
         self.boundary_select.setEnabled(enabled)
         self.sampling.setEnabled(enabled)
@@ -824,6 +865,7 @@ class TPMSTaskPanel:
         doc.openTransaction("Change TPMS boundary")
         try:
             obj.BoundaryMode = self.boundary_mode.currentText()
+            obj.BoundaryEvaluation = self.boundary_evaluation.currentText()
             obj.BoundaryObject = self._current_boundary_object()
             obj.RegionMode = self.region_mode.currentText()
             obj.RegionIndex = int(self.region_index.currentData() or 0)
@@ -1012,6 +1054,7 @@ class TPMSTaskPanel:
                 obj.RotationObject = self._pending_rotation_object
             obj.MeshStitching = False
             obj.BoundaryMode = self.boundary_mode.currentText()
+            obj.BoundaryEvaluation = self.boundary_evaluation.currentText()
             if hasattr(self, "_pending_boundary_object"):
                 obj.BoundaryObject = self._pending_boundary_object
             obj.RegionMode = self.region_mode.currentText()

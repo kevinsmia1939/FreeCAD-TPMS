@@ -39,8 +39,8 @@ Restart FreeCAD and select the `TPMS Generator` workbench.
 3. Click `Create TPMS Unit Cell`.
 4. Select the generated `Base Region Parameters` object in the tree.
 5. Set `Boundary Mode` to `Selected solid` and choose the boundary object.
-6. Adjust the equation, part type, resolution, cell size, offset/thickness, and
-   capping options.
+6. Adjust the equation, part type, resolution, cell size, sheet/skeletal
+   thickness, and capping options.
 7. Click `Refresh TPMS` or recompute the document.
 
 Double-click a TPMS parameter object in the tree to reopen its task panel.
@@ -63,11 +63,11 @@ regions.
 
 Transition regions support two blend modes:
 
-- `Threshold interval blend`: blends the valid TPMS material interval for each
-  part type.  For example, a sheet is treated as the interval around the TPMS
-  zero surface, while upper and lower skeletal parts are treated as one-sided
-  intervals.  This is the safer choice for transitions between sheet and
-  skeletal TPMS because it avoids field cancellation that can create torn or
+- `Offset Surface Interpolation`: blends the valid TPMS material interval for
+  each part type.  For example, a sheet is treated as the interval around the
+  TPMS zero surface, while upper and lower skeletal parts are treated as
+  one-sided intervals.  This is the safer choice for transitions between sheet
+  and skeletal TPMS because it avoids field cancellation that can create torn or
   abrupt-looking meshes.
 - `Morphological signed-field blend`: blends the signed implicit material
   fields directly.  This matches the common form `F_hybrid = w * F_target +
@@ -75,7 +75,7 @@ Transition regions support two blend modes:
   transitions, or similar structures.  For sheet-to-skeletal transitions,
   direct signed-field blending can cancel near the midpoint of the transition,
   which may create torn or abrupt-looking meshes.  In that case, choose
-  `Threshold interval blend` explicitly.
+  `Offset Surface Interpolation` explicitly.
 
 ## Cylindrical Rings
 
@@ -102,6 +102,10 @@ generation, cylindrical ring origin handling, and basic mesh validity.
 - Mesh relaxation is optional and off by default for predictable boundaries.
 - Capping is on by default so generated sheet and skeletal meshes can be closed
   against the selected boundary.
+- Sheet thickness is symmetric around the TPMS mid-surface.  A sheet thickness
+  of `t` generates material between approximately `F = -t/2` and `F = +t/2`,
+  so both labyrinth sides are offset equally before boundary clipping and
+  grading are applied.
 - `example/example1.FCStd` and `example/screenshot.png` show a multi-region TPMS
   setup in FreeCAD.
 

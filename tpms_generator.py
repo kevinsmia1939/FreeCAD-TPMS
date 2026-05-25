@@ -33,6 +33,8 @@ COORDINATE_CYLINDRICAL_RING = "Cylindrical ring"
 BOUNDARY_BOX = "Box"
 BOUNDARY_SPHERE = "Sphere"
 BOUNDARY_SELECTED_SOLID = "Selected solid"
+BOUNDARY_EVALUATION_ANALYTICAL = "Analytical when available"
+BOUNDARY_EVALUATION_TESSELLATED_SDF = "Tessellated SDF"
 DENSITY_COUNT_PRESERVE = "Preserve overall count"
 DENSITY_COUNT_FOLLOW = "Follow unit cell density"
 GRADIENT_FACE_DISTANCE = "Selected-face distance field"
@@ -40,7 +42,7 @@ GRADIENT_FACE_PLANE = "Face plane"
 GRADIENT_HARMONIC = "Harmonic field"
 HARMONIC_BOUNDARY_CONDUCTOR = "Conductor"
 HARMONIC_BOUNDARY_INSULATOR = "Insulator"
-TRANSITION_BLEND_THRESHOLD = "Threshold interval blend"
+TRANSITION_BLEND_THRESHOLD = "Offset Surface Interpolation"
 TRANSITION_BLEND_SIGNED_FIELD = "Morphological signed-field blend"
 
 _BOUNDARY_FIELD_CACHE = {}
@@ -106,6 +108,10 @@ def configure_vtk_smp():
 
 def boundary_modes():
     return [BOUNDARY_BOX, BOUNDARY_SELECTED_SOLID]
+
+
+def boundary_evaluation_modes():
+    return [BOUNDARY_EVALUATION_ANALYTICAL, BOUNDARY_EVALUATION_TESSELLATED_SDF]
 
 
 def coordinate_modes():
@@ -304,6 +310,69 @@ def _make_grid(
     sy = ky * py
     sz = kz * pz
     return grid, sx, sy, sz, offset_field, wx, wy, wz
+
+
+def _cylindrical_phase_grid(
+    wx,
+    wy,
+    wz,
+    cell_size,
+    phase,
+    origin=None,
+    origin_rotation=None,
+    boundary_object=None,
+    ring_angular_cells=8,
+    density_mode="Uniform",
+    base_density=1.0,
+    density_controls=None,
+    density_count_mode=DENSITY_COUNT_FOLLOW,
+    density_gradient=GRADIENT_FACE_DISTANCE,
+    boundary_mode=BOUNDARY_BOX,
+    sampling=0.0,
+    grading_resolution=16,
+    harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
+):
+    cell_size = np.asarray(cell_size, dtype=float)
+    phase = np.asarray(phase, dtype=float)
+    if origin is None:
+        origin = _default_origin(boundary_mode, boundary_object)
+    origin = np.asarray(origin, dtype=float)
+
+    rotation_matrix = _rotation_matrix(origin_rotation, boundary_object)
+    if rotation_matrix is not None:
+        lx, ly, lz = _world_to_origin_frame_arrays(rotation_matrix, wx, wy, wz, origin)
+    else:
+        lx = wx - origin[0]
+        ly = wy - origin[1]
+        lz = wz - origin[2]
+
+    angular_cells = max(1, int(ring_angular_cells))
+    period = max(float(cell_size[0]) * float(angular_cells), 1e-9)
+    theta = np.mod(np.arctan2(ly, lx), 2.0 * math.pi)
+    angular = theta * period / (2.0 * math.pi)
+    radial = np.sqrt(lx * lx + ly * ly)
+
+    px, py, pz = _density_phase_coordinates(
+        angular,
+        radial,
+        lz,
+        wx,
+        wy,
+        wz,
+        phase,
+        density_mode,
+        base_density,
+        density_controls,
+        density_count_mode,
+        density_gradient,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        grading_resolution,
+        harmonic_boundary_condition,
+    )
+    kx, ky, kz = [2.0 * math.pi / max(cell_size[i], 1e-9) for i in range(3)]
+    return kx * px, ky * py, kz * pz
 
 
 def _default_origin(boundary_mode, boundary_object):
@@ -985,6 +1054,10 @@ def _implicit_distances(surface, points):
 
 
 def _selected_boundary_distance_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    analytical = _analytic_boundary_field(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    if analytical is not None:
+        return np.abs(analytical)
+
     solids = getattr(boundary_object, "BoundaryRegionSolids", None)
     if solids:
         field = None
@@ -1013,20 +1086,11 @@ def _selected_boundary_distance_vtk(boundary_object, wx, wy, wz, sampling, fallb
     return distance
 
 
-def _boundary_shell_mask(inside):
-    mask = np.zeros(inside.shape, dtype=bool)
-    for axis in range(3):
-        lower = [slice(None)] * 3
-        upper = [slice(None)] * 3
-        lower[axis] = slice(0, -1)
-        upper[axis] = slice(1, None)
-        diff = inside[tuple(lower)] != inside[tuple(upper)]
-        mask[tuple(lower)] |= diff
-        mask[tuple(upper)] |= diff
-    return mask
-
-
 def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution):
+    analytical = _analytic_boundary_field(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    if analytical is not None:
+        return analytical
+
     solids = getattr(boundary_object, "BoundaryRegionSolids", None)
     if solids:
         field = None
@@ -1051,18 +1115,8 @@ def _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, f
     surface = _boundary_to_polydata(boundary_object, wx, wy, wz, sampling, fallback_resolution)
     points = np.column_stack((wx.ravel(order="C"), wy.ravel(order="C"), wz.ravel(order="C")))
     inside = _classify_points(surface, points).reshape(wx.shape, order="C")
-    shell = _boundary_shell_mask(inside)
-
-    spacing = min(
-        _axis_spacing(wx, axis=0),
-        _axis_spacing(wy, axis=1),
-        _axis_spacing(wz, axis=2),
-    )
-    field = np.where(inside, spacing, -spacing).astype(float)
-    if np.any(shell):
-        shell_points = np.column_stack((wx[shell], wy[shell], wz[shell]))
-        signed_distance = _implicit_distances(surface, shell_points)
-        field[shell] = -signed_distance
+    distance = np.abs(_implicit_distances(surface, points)).reshape(wx.shape, order="C")
+    field = np.where(inside, distance, -distance).astype(float)
     _store_boundary_field_cache(cache_key, field)
     return field
 
@@ -1156,11 +1210,11 @@ def _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling=0.0):
     elif boundary_mode == BOUNDARY_SELECTED_SOLID:
         if boundary_object is None:
             raise ValueError("Selected boundary needs a linked solid or mesh object")
-        field = _analytic_boundary_field(boundary_object, wx, wy, wz)
+        fallback_resolution = max(wx.shape)
+        field = _analytic_boundary_field(boundary_object, wx, wy, wz, sampling, fallback_resolution)
         if field is not None:
             return field
         try:
-            fallback_resolution = max(wx.shape)
             field = _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, fallback_resolution)
         except Exception as exc:
             App.Console.PrintWarning(
@@ -1180,9 +1234,16 @@ def _boundary_field(boundary_mode, boundary_object, wx, wy, wz, sampling=0.0):
     return field
 
 
-def _analytic_boundary_field(boundary_object, wx, wy, wz):
+def _analytic_boundary_field(boundary_object, wx, wy, wz, sampling=0.0, fallback_resolution=None):
     if bool(getattr(boundary_object, "ForceTessellatedBoundary", False)):
         return None
+    csg_field = _analytic_csg_boundary_field(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    if csg_field is not None:
+        return csg_field
+    return _primitive_analytic_boundary_field(boundary_object, wx, wy, wz)
+
+
+def _primitive_analytic_boundary_field(boundary_object, wx, wy, wz):
     type_id = getattr(boundary_object, "TypeId", "")
     placement = getattr(boundary_object, "Placement", None)
     if placement is None:
@@ -1198,6 +1259,23 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
         height = float(boundary_object.Height)
         lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
         return _cylindrical_shell_field(lx, ly, lz, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), radius, 0.0, 0.0, height)
+
+    if _is_basic_tube_feature(boundary_object):
+        inner_radius = _length_value(getattr(boundary_object, "InnerRadius", 0.0))
+        outer_radius = _length_value(getattr(boundary_object, "OuterRadius", 0.0))
+        height = _length_value(getattr(boundary_object, "Height", 0.0))
+        lx, ly, lz = _world_to_local_arrays(placement, wx, wy, wz)
+        return _cylindrical_shell_field(
+            lx,
+            ly,
+            lz,
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            outer_radius,
+            inner_radius,
+            0.0,
+            height,
+        )
 
     if _is_part_box(boundary_object):
         length = float(boundary_object.Length)
@@ -1226,6 +1304,202 @@ def _analytic_boundary_field(boundary_object, wx, wy, wz):
     return None
 
 
+def _cylindrical_shell_from_boundary_object(boundary_object):
+    if boundary_object is None or bool(getattr(boundary_object, "ForceTessellatedBoundary", False)):
+        return None
+
+    if _is_boolean_fragments_feature(boundary_object):
+        shells = []
+        for source_object in _boolean_fragments_objects(boundary_object):
+            shell = _cylindrical_shell_from_boundary_object(source_object)
+            if shell is None:
+                return None
+            shells.append(shell)
+        if not shells:
+            return None
+        return _combine_coaxial_shells(shells)
+
+    if _is_basic_tube_feature(boundary_object):
+        placement = getattr(boundary_object, "Placement", None)
+        if placement is None:
+            return None
+        center, axis = _placement_z_axis(placement)
+        return (
+            tuple(center),
+            tuple(axis),
+            _length_value(getattr(boundary_object, "OuterRadius", 0.0)),
+            _length_value(getattr(boundary_object, "InnerRadius", 0.0)),
+            0.0,
+            _length_value(getattr(boundary_object, "Height", 0.0)),
+        )
+
+    if _is_part_cylinder(boundary_object):
+        placement = getattr(boundary_object, "Placement", None)
+        if placement is None:
+            return None
+        center, axis = _placement_z_axis(placement)
+        return (
+            tuple(center),
+            tuple(axis),
+            float(boundary_object.Radius),
+            0.0,
+            0.0,
+            float(boundary_object.Height),
+        )
+
+    shape = getattr(boundary_object, "Shape", None)
+    if shape is not None:
+        return _cylindrical_shell_from_shape(shape)
+    return None
+
+
+def _placement_z_axis(placement):
+    matrix = placement.Matrix
+    center = np.array((float(matrix.A14), float(matrix.A24), float(matrix.A34)), dtype=float)
+    axis = np.array((float(matrix.A13), float(matrix.A23), float(matrix.A33)), dtype=float)
+    length = float(np.linalg.norm(axis))
+    if length <= 1e-12:
+        axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    else:
+        axis = axis / length
+    return center, axis
+
+
+def _combine_coaxial_shells(shells):
+    center, axis, outer_radius, inner_radius, hmin, hmax = shells[0]
+    center = np.asarray(center, dtype=float)
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
+    inner = float(inner_radius)
+    outer = float(outer_radius)
+    lower = float(hmin)
+    upper = float(hmax)
+    tolerance = max(abs(outer), 1.0) * 1e-6
+
+    for shell in shells[1:]:
+        other_center, other_axis, other_outer, other_inner, other_hmin, other_hmax = shell
+        other_center = np.asarray(other_center, dtype=float)
+        other_axis = np.asarray(other_axis, dtype=float)
+        other_axis = other_axis / max(float(np.linalg.norm(other_axis)), 1e-12)
+        if abs(abs(float(np.dot(axis, other_axis))) - 1.0) > 1e-6:
+            return None
+        offset = other_center - center
+        radial_offset = offset - np.dot(offset, axis) * axis
+        if float(np.linalg.norm(radial_offset)) > tolerance:
+            return None
+        axial_offset = float(np.dot(offset, axis))
+        inner = min(inner, float(other_inner))
+        outer = max(outer, float(other_outer))
+        lower = min(lower, axial_offset + float(other_hmin))
+        upper = max(upper, axial_offset + float(other_hmax))
+
+    if outer <= max(inner, 0.0) or upper <= lower:
+        return None
+    return tuple(center), tuple(axis), outer, max(0.0, inner), lower, upper
+
+
+def _analytic_csg_boundary_field(boundary_object, wx, wy, wz, sampling=0.0, fallback_resolution=None):
+    if boundary_object is None:
+        return None
+    type_id = getattr(boundary_object, "TypeId", "")
+    if _is_boolean_fragments_feature(boundary_object):
+        wx, wy, wz = _csg_operand_coordinates(boundary_object, wx, wy, wz)
+        objects = _boolean_fragments_objects(boundary_object)
+        if not objects:
+            return None
+        fields = []
+        for source_object in objects:
+            field = _analytic_or_leaf_boundary_field(source_object, wx, wy, wz, sampling, fallback_resolution)
+            if field is None:
+                return None
+            fields.append(field)
+        result = fields[0]
+        for field in fields[1:]:
+            result = np.maximum(result, field)
+        return result
+
+    if type_id in ("Part::Fuse", "Part::Cut", "Part::Common"):
+        wx, wy, wz = _csg_operand_coordinates(boundary_object, wx, wy, wz)
+        base = getattr(boundary_object, "Base", None)
+        tool = getattr(boundary_object, "Tool", None)
+        if base is None or tool is None:
+            return None
+        base_field = _analytic_or_leaf_boundary_field(base, wx, wy, wz, sampling, fallback_resolution)
+        tool_field = _analytic_or_leaf_boundary_field(tool, wx, wy, wz, sampling, fallback_resolution)
+        if base_field is None or tool_field is None:
+            return None
+        if type_id == "Part::Fuse":
+            return np.maximum(base_field, tool_field)
+        if type_id == "Part::Common":
+            return np.minimum(base_field, tool_field)
+        return np.minimum(base_field, -tool_field)
+
+    if type_id in ("Part::MultiFuse", "Part::MultiCommon"):
+        wx, wy, wz = _csg_operand_coordinates(boundary_object, wx, wy, wz)
+        shapes = list(getattr(boundary_object, "Shapes", []) or [])
+        if not shapes:
+            return None
+        fields = []
+        for shape_object in shapes:
+            field = _analytic_or_leaf_boundary_field(shape_object, wx, wy, wz, sampling, fallback_resolution)
+            if field is None:
+                return None
+            fields.append(field)
+        result = fields[0]
+        for field in fields[1:]:
+            if type_id == "Part::MultiFuse":
+                result = np.maximum(result, field)
+            else:
+                result = np.minimum(result, field)
+        return result
+
+    return None
+
+
+def _is_boolean_fragments_feature(boundary_object):
+    if getattr(boundary_object, "TypeId", "") != "Part::FeaturePython":
+        return False
+    proxy = getattr(boundary_object, "Proxy", None)
+    if getattr(proxy, "Type", "") == "FeatureBooleanFragments":
+        return True
+    return type(proxy).__name__ == "FeatureBooleanFragments"
+
+
+def _boolean_fragments_objects(boundary_object):
+    objects = list(getattr(boundary_object, "Objects", []) or [])
+    if objects:
+        return objects
+    return list(getattr(boundary_object, "Shapes", []) or [])
+
+
+def _csg_operand_coordinates(boundary_object, wx, wy, wz):
+    placement = getattr(boundary_object, "Placement", None)
+    if placement is None:
+        return wx, wy, wz
+    try:
+        return _world_to_local_arrays(placement, wx, wy, wz)
+    except Exception:
+        return wx, wy, wz
+
+
+def _analytic_or_leaf_boundary_field(boundary_object, wx, wy, wz, sampling=0.0, fallback_resolution=None):
+    if boundary_object is None or bool(getattr(boundary_object, "ForceTessellatedBoundary", False)):
+        return None
+    field = _analytic_csg_boundary_field(boundary_object, wx, wy, wz, sampling, fallback_resolution)
+    if field is not None:
+        return field
+    field = _primitive_analytic_boundary_field(boundary_object, wx, wy, wz)
+    if field is not None:
+        return field
+    if hasattr(boundary_object, "Shape") or hasattr(boundary_object, "Mesh"):
+        try:
+            resolution = max(wx.shape) if fallback_resolution is None else fallback_resolution
+            return _selected_boundary_field_signed_vtk(boundary_object, wx, wy, wz, sampling, resolution)
+        except Exception as exc:
+            App.Console.PrintWarning("Mixed analytical CSG leaf fell back unsuccessfully: {}\n".format(exc))
+    return None
+
+
 def _is_part_cylinder(boundary_object):
     if getattr(boundary_object, "TypeId", "") != "Part::Cylinder":
         return False
@@ -1240,6 +1514,26 @@ def _is_part_box(boundary_object):
         getattr(boundary_object, "TypeId", "") == "Part::Box"
         and all(hasattr(boundary_object, name) for name in ("Length", "Width", "Height"))
     )
+
+
+def _is_basic_tube_feature(boundary_object):
+    if getattr(boundary_object, "TypeId", "") != "Part::FeaturePython":
+        return False
+    if not all(hasattr(boundary_object, name) for name in ("InnerRadius", "OuterRadius", "Height")):
+        return False
+    proxy = getattr(boundary_object, "Proxy", None)
+    if type(proxy).__name__ != "TubeFeature":
+        return False
+    return _length_value(getattr(boundary_object, "OuterRadius", 0.0)) > _length_value(
+        getattr(boundary_object, "InnerRadius", 0.0)
+    )
+
+
+def _length_value(value):
+    try:
+        return float(value.Value)
+    except Exception:
+        return float(value)
 
 
 def _cylindrical_shell_from_shape(shape):
@@ -1489,6 +1783,39 @@ def _generate_uncapped_polydata(grid, part, has_boundary):
     return surface.clean().triangulate()
 
 
+def _extract_part_polydata(grid, part, has_boundary, add_caps, material_scalars=None):
+    if material_scalars is not None:
+        if not add_caps:
+            surface = grid.contour(isosurfaces=[0.0], scalars=material_scalars)
+            surface = _apply_boundary_clip(surface, has_boundary)
+            return surface.extract_surface(algorithm="dataset_surface").clean().triangulate()
+        volume = grid.clip_scalar(scalars=material_scalars, value=0.0, invert=False)
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+
+    if not add_caps:
+        return _generate_uncapped_polydata(grid, part, has_boundary)
+
+    if part == PART_SHEET:
+        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
+            scalars="lower_surface",
+            invert=False,
+        )
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_UPPER:
+        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_LOWER:
+        volume = grid.clip_scalar(scalars="lower_surface")
+        volume = _apply_boundary_clip(volume, has_boundary)
+        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    if part == PART_SURFACE:
+        return grid.contour(isosurfaces=[0.0], scalars="surface").extract_surface().clean().triangulate()
+    raise ValueError("Unsupported TPMS part: {}".format(part))
+
+
 def generate_polydata(
     equation,
     part=PART_SHEET,
@@ -1550,28 +1877,7 @@ def generate_polydata(
     grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
     grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
     has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
-
-    if not add_caps:
-        return _generate_uncapped_polydata(grid, part, has_boundary)
-
-    if part == PART_SHEET:
-        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
-            scalars="lower_surface",
-            invert=False,
-        )
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    if part == PART_UPPER:
-        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    if part == PART_LOWER:
-        volume = grid.clip_scalar(scalars="lower_surface")
-        volume = _apply_boundary_clip(volume, has_boundary)
-        return volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    if part == PART_SURFACE:
-        return grid.contour(isosurfaces=[0.0], scalars="surface").extract_surface().clean().triangulate()
-    raise ValueError("Unsupported TPMS part: {}".format(part))
+    return _extract_part_polydata(grid, part, has_boundary, add_caps)
 
 
 def generate_hybrid_polydata(
@@ -1601,33 +1907,81 @@ def generate_hybrid_polydata(
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     grading_resolution=16,
     harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
+    coordinate_mode=COORDINATE_CARTESIAN,
+    ring_angular_cells=8,
 ):
     configure_vtk_smp()
     region_specs = list(region_specs or [])
     transition_controls = list(transition_controls or [])
     transition_region_specs = list(transition_region_specs or [])
-    grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
-        cell_size,
-        repeat_cell,
-        resolution,
-        phase,
-        boundary_mode,
-        boundary_object,
-        sampling,
-        origin,
-        origin_rotation,
-        density_mode,
-        base_density,
-        density_controls,
-        density_count_mode,
-        density_gradient,
-        "Uniform",
-        offset,
-        None,
-        GRADIENT_FACE_DISTANCE,
-        grading_resolution,
-        harmonic_boundary_condition,
-    )
+    cylindrical_grid = None
+    if str(coordinate_mode) == COORDINATE_CYLINDRICAL_RING:
+        cylindrical_grid = _make_hybrid_cylindrical_ring_grid(
+            boundary_object,
+            cell_size,
+            resolution,
+            phase,
+            origin,
+            origin_rotation,
+            ring_angular_cells,
+            density_mode,
+            base_density,
+            density_controls,
+            density_count_mode,
+            density_gradient,
+            boundary_mode,
+            sampling,
+            offset,
+            grading_resolution,
+            harmonic_boundary_condition,
+        )
+    if cylindrical_grid is not None:
+        grid, x, y, z, offset_field, wx, wy, wz, ring_map = cylindrical_grid
+    else:
+        ring_map = None
+        grid, x, y, z, offset_field, wx, wy, wz = _make_grid(
+            cell_size,
+            repeat_cell,
+            resolution,
+            phase,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            origin,
+            origin_rotation,
+            density_mode,
+            base_density,
+            density_controls,
+            density_count_mode,
+            density_gradient,
+            "Uniform",
+            offset,
+            None,
+            GRADIENT_FACE_DISTANCE,
+            grading_resolution,
+            harmonic_boundary_condition,
+        )
+        if str(coordinate_mode) == COORDINATE_CYLINDRICAL_RING:
+            x, y, z = _cylindrical_phase_grid(
+                wx,
+                wy,
+                wz,
+                cell_size,
+                phase,
+                origin,
+                origin_rotation,
+                boundary_object,
+                ring_angular_cells,
+                density_mode,
+                base_density,
+                density_controls,
+                density_count_mode,
+                density_gradient,
+                boundary_mode,
+                sampling,
+                grading_resolution,
+                harmonic_boundary_condition,
+            )
 
     field = np.asarray(evaluate_equation(equation, x, y, z), dtype=float)
     if field.shape == ():
@@ -1908,16 +2262,124 @@ def generate_hybrid_polydata(
     grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
     grid["material"] = material_field.ravel(order="F")
     has_boundary = _add_boundary_field(grid, wx, wy, wz, boundary_mode, boundary_object, sampling)
-
-    if not add_caps:
-        surface = grid.contour(isosurfaces=[0.0], scalars="material")
-        surface = _apply_boundary_clip(surface, has_boundary)
-        surface = surface.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    else:
-        volume = grid.clip_scalar(scalars="material", value=0.0, invert=False)
-        volume = _apply_boundary_clip(volume, has_boundary)
-        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
+    surface = _extract_part_polydata(grid, part, has_boundary, add_caps, material_scalars="material")
+    if ring_map is not None:
+        radius, period, map_origin, rotation_matrix = ring_map
+        surface = _remove_periodic_axis_caps(surface, period)
+        surface = _stitch_periodic_axis_edges(surface, period)
+        surface = _map_ring_polydata_to_world(surface, radius, period, map_origin, rotation_matrix)
     return surface
+
+
+def _make_hybrid_cylindrical_ring_grid(
+    boundary_object,
+    cell_size,
+    resolution,
+    phase,
+    origin,
+    origin_rotation,
+    ring_angular_cells,
+    density_mode,
+    base_density,
+    density_controls,
+    density_count_mode,
+    density_gradient,
+    boundary_mode,
+    sampling,
+    offset,
+    grading_resolution,
+    harmonic_boundary_condition,
+):
+    shell = _cylindrical_shell_from_boundary_object(boundary_object)
+    if shell is None:
+        return None
+    shell_center, shell_axis, outer_radius, inner_radius, hmin, hmax = shell
+    shell_center = np.asarray(shell_center, dtype=float)
+    shell_axis = np.asarray(shell_axis, dtype=float)
+    shell_axis = shell_axis / max(float(np.linalg.norm(shell_axis)), 1e-12)
+
+    if origin is None:
+        origin = shell_center
+    origin = np.asarray(origin, dtype=float)
+
+    rotation_matrix = _rotation_matrix(origin_rotation, boundary_object)
+    if rotation_matrix is None:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+        if abs(abs(float(np.dot(shell_axis, z_axis))) - 1.0) > 1e-6:
+            return None
+
+    cell_size = np.asarray(cell_size, dtype=float)
+    phase = np.asarray(phase, dtype=float)
+    inner_radius = max(0.0, float(inner_radius))
+    outer_radius = max(inner_radius + 1e-9, float(outer_radius))
+    height = max(float(hmax) - float(hmin), 1e-9)
+    radius = inner_radius + 0.5 * (outer_radius - inner_radius)
+    angular_cells = max(1, int(ring_angular_cells))
+    period = float(cell_size[0]) * float(angular_cells)
+    radial_spacing = max(float(cell_size[1]), 1e-9) / max(int(resolution), 1)
+    height_spacing = max(float(cell_size[2]), 1e-9) / max(int(resolution), 1)
+    nu = int(resolution) * angular_cells + 1
+
+    u_coords = _make_axis(0.0, period, nu)
+    radial_coords = _make_aligned_axis(inner_radius, outer_radius, radial_spacing, 0.0)
+    h_coords = _make_aligned_axis(float(hmin), float(hmax), height_spacing, 0.0)
+    v_coords = radial_coords - radius
+    u, v, h = np.meshgrid(u_coords, v_coords, h_coords, indexing="ij")
+    local_x, local_y, local_z = _cylindrical_ring_local_arrays(u, v, h, radius, period)
+    if rotation_matrix is not None:
+        wx, wy, wz = _origin_frame_to_world_arrays(rotation_matrix, local_x, local_y, local_z, origin)
+    else:
+        wx = local_x + origin[0]
+        wy = local_y + origin[1]
+        wz = local_z + origin[2]
+
+    grid = pv.ImageData(
+        dimensions=(len(u_coords), len(v_coords), len(h_coords)),
+        spacing=(
+            float(u_coords[1] - u_coords[0]) if len(u_coords) > 1 else 1.0,
+            float(v_coords[1] - v_coords[0]) if len(v_coords) > 1 else 1.0,
+            float(h_coords[1] - h_coords[0]) if len(h_coords) > 1 else 1.0,
+        ),
+        origin=(0.0, float(v_coords[0]), float(h_coords[0])),
+    )
+
+    density = _density_multiplier(wx, wy, wz, density_mode, base_density, density_controls)
+    if str(density_mode) == "Non-uniform" and str(density_gradient) == GRADIENT_HARMONIC and density_controls:
+        density = _harmonic_interpolated_field(
+            wx,
+            wy,
+            wz,
+            boundary_mode,
+            boundary_object,
+            sampling,
+            density_controls,
+            max(0.05, float(base_density)),
+            "density",
+            minimum=0.05,
+            grading_resolution=grading_resolution,
+            harmonic_boundary_condition=harmonic_boundary_condition,
+        )
+    radial_position = radius + v
+    px = u + phase[0]
+    py = (radial_position + phase[1]) * density
+    pz = (h + phase[2]) * density
+    offset_field = _offset_field(
+        wx,
+        wy,
+        wz,
+        float(offset),
+        "Uniform",
+        None,
+        GRADIENT_FACE_DISTANCE,
+        boundary_mode,
+        boundary_object,
+        sampling,
+        grading_resolution,
+        harmonic_boundary_condition,
+    )
+    kx, ky, kz = [2.0 * math.pi / max(float(cell_size[i]), 1e-9) for i in range(3)]
+    ring_map = (radius, period, origin, rotation_matrix)
+    return grid, kx * px, ky * py, kz * pz, offset_field, wx, wy, wz, ring_map
 
 
 def generate_cylindrical_ring_polydata(
@@ -2065,28 +2527,7 @@ def generate_cylindrical_ring_polydata(
     grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
     grid["upper_surface"] = (field - 0.5 * offset_field).ravel(order="F")
     grid["boundary"] = boundary.ravel(order="F")
-
-    if not add_caps:
-        surface = _generate_uncapped_polydata(grid, part, True)
-    elif part == PART_SHEET:
-        volume = grid.clip_scalar(scalars="upper_surface").clip_scalar(
-            scalars="lower_surface",
-            invert=False,
-        )
-        volume = _apply_boundary_clip(volume, True)
-        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    elif part == PART_UPPER:
-        volume = grid.clip_scalar(scalars="upper_surface", invert=False)
-        volume = _apply_boundary_clip(volume, True)
-        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    elif part == PART_LOWER:
-        volume = grid.clip_scalar(scalars="lower_surface")
-        volume = _apply_boundary_clip(volume, True)
-        surface = volume.extract_surface(algorithm="dataset_surface").clean().triangulate()
-    elif part == PART_SURFACE:
-        surface = grid.contour(isosurfaces=[0.0], scalars="surface").extract_surface().clean().triangulate()
-    else:
-        raise ValueError("Unsupported TPMS part: {}".format(part))
+    surface = _extract_part_polydata(grid, part, True, add_caps)
 
     surface = _remove_periodic_axis_caps(surface, period)
     surface = _stitch_periodic_axis_edges(surface, period)
@@ -2657,6 +3098,8 @@ def generate_hybrid_freecad_mesh(
     density_offset_gradient=GRADIENT_FACE_DISTANCE,
     grading_resolution=16,
     harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
+    coordinate_mode=COORDINATE_CARTESIAN,
+    ring_angular_cells=8,
 ):
     polydata = generate_hybrid_polydata(
         equation,
@@ -2685,6 +3128,8 @@ def generate_hybrid_freecad_mesh(
         density_offset_gradient,
         grading_resolution,
         harmonic_boundary_condition,
+        coordinate_mode,
+        ring_angular_cells,
     )
     return _prepare_freecad_mesh(
         polydata,

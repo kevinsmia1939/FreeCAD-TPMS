@@ -673,6 +673,477 @@ def run_cylindrical_ring_radial_continuity_case():
     print("PASS cylindrical_ring_radial_continuity shared_points={}".format(len(common_5)))
 
 
+def run_hybrid_cylindrical_coordinate_mode_case():
+    import hashlib
+    import Part
+
+    boundary = _BoundaryProbe(Part.makeCylinder(5.0, 8.0, App.Vector(0.0, 0.0, 0.0)))
+    region_spec = {
+        "index": 0,
+        "boundary_object": boundary,
+        "surface": "Gyroid",
+        "part": tpms_generator.PART_SHEET,
+        "equation": tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        "offset": 0.35,
+        "base_density": 1.0,
+    }
+    signatures = []
+    for coordinate_mode in (
+        tpms_generator.COORDINATE_CARTESIAN,
+        tpms_generator.COORDINATE_CYLINDRICAL_RING,
+    ):
+        polydata = tpms_generator.generate_hybrid_polydata(
+            tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+            tpms_generator.PART_SHEET,
+            (10.0, 10.0, 10.0),
+            (1, 1, 1),
+            8,
+            0.35,
+            (0.0, 0.0, 0.0),
+            tpms_generator.BOUNDARY_SELECTED_SOLID,
+            boundary,
+            0.0,
+            False,
+            (0.0, 0.0, 0.0),
+            None,
+            1.0,
+            [region_spec],
+            [],
+            [],
+            coordinate_mode=coordinate_mode,
+            ring_angular_cells=8,
+        )
+        if polydata.n_points <= 0 or polydata.n_cells <= 0:
+            raise RuntimeError("{} hybrid coordinate mode generated empty polydata".format(coordinate_mode))
+        sample = [tuple(round(float(value), 4) for value in point) for point in polydata.points[:2000]]
+        signatures.append((coordinate_mode, int(polydata.n_cells), hashlib.sha256(repr(sample).encode("utf-8")).hexdigest()[:16]))
+    if signatures[0][1:] == signatures[1][1:]:
+        raise RuntimeError("Hybrid cylindrical coordinate mode matched Cartesian signature: {}".format(signatures))
+    print(
+        "PASS hybrid_cylindrical_coordinate_mode cartesian_facets={} cylindrical_facets={} cartesian_hash={} cylindrical_hash={}".format(
+            signatures[0][1],
+            signatures[1][1],
+            signatures[0][2],
+            signatures[1][2],
+        )
+    )
+
+
+def run_tessellated_boundary_signed_distance_case():
+    import numpy as np
+    import Part
+
+    shape = Part.makeBox(8.0, 8.0, 8.0, App.Vector(-4.0, -4.0, -4.0))
+    shape.rotate(App.Vector(0.0, 0.0, 0.0), App.Vector(0.0, 1.0, 0.0), 27.0)
+    boundary = _BoundaryProbe(shape)
+    boundary.ForceTessellatedBoundary = True
+
+    coords = np.linspace(-6.0, 6.0, 13)
+    wx, wy, wz = np.meshgrid(coords, coords, coords, indexing="ij")
+    field = tpms_generator._selected_boundary_field_signed_vtk(boundary, wx, wy, wz, 0.0, 13)
+    spacing = float(coords[1] - coords[0])
+    positive = field[field > 0.0]
+    negative = field[field < 0.0]
+    if not len(positive) or not len(negative):
+        raise RuntimeError("Tessellated signed boundary field did not classify both sides")
+    if float(np.max(positive)) <= spacing * 1.5:
+        raise RuntimeError("Tessellated signed boundary field does not contain interior distances")
+    if len(np.unique(np.round(np.abs(field), 4))) <= 8:
+        raise RuntimeError("Tessellated signed boundary field still looks binary/stepwise")
+
+    polydata = tpms_generator.generate_polydata(
+        tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        tpms_generator.PART_SHEET,
+        (8.0, 8.0, 8.0),
+        (1, 1, 1),
+        8,
+        0.35,
+        (0.0, 0.0, 0.0),
+        tpms_generator.BOUNDARY_SELECTED_SOLID,
+        boundary,
+        0.0,
+        True,
+        None,
+        None,
+    )
+    if polydata.n_points <= 0 or polydata.n_cells <= 0:
+        raise RuntimeError("Tessellated signed boundary generated an empty capped mesh")
+    print(
+        "PASS tessellated_boundary_signed_distance max_inside={:.4f} unique_distances={} facets={}".format(
+            float(np.max(positive)),
+            len(np.unique(np.round(np.abs(field), 4))),
+            int(polydata.n_cells),
+        )
+    )
+
+
+def run_boundary_evaluation_mode_case():
+    import numpy as np
+    import Part
+
+    doc = App.newDocument("TPMS_boundary_evaluation_mode_test")
+    try:
+        sphere = doc.addObject("Part::Sphere", "Analytical_Or_SDF_Sphere")
+        sphere.Radius = 5.0
+        doc.recompute()
+
+        _container, controller, _mesh_obj = make_tpms_unit_cell(doc)
+        controller.BoundaryMode = tpms_generator.BOUNDARY_SELECTED_SOLID
+        controller.BoundaryObject = sphere
+        controller.RegionMode = REGION_MODE_ALL
+
+        controller.BoundaryEvaluation = tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL
+        analytical_boundary, _description, _count = selected_boundary_region(controller)
+        coords = np.linspace(-6.0, 6.0, 9)
+        wx, wy, wz = np.meshgrid(coords, coords, coords, indexing="ij")
+        analytical_field = tpms_generator._analytic_boundary_field(analytical_boundary, wx, wy, wz)
+        if analytical_field is None:
+            raise RuntimeError("Analytical boundary evaluation did not preserve the Part sphere analytical field")
+
+        controller.BoundaryEvaluation = tpms_generator.BOUNDARY_EVALUATION_TESSELLATED_SDF
+        tessellated_boundary, _description, _count = selected_boundary_region(controller)
+        if not bool(getattr(tessellated_boundary, "ForceTessellatedBoundary", False)):
+            raise RuntimeError("Tessellated SDF boundary evaluation did not force tessellation")
+        if tpms_generator._analytic_boundary_field(tessellated_boundary, wx, wy, wz) is not None:
+            raise RuntimeError("Tessellated SDF boundary evaluation still used an analytical field")
+        sdf_field = tpms_generator._selected_boundary_field_signed_vtk(tessellated_boundary, wx, wy, wz, 0.0, 9)
+        if not (np.any(sdf_field > 0.0) and np.any(sdf_field < 0.0)):
+            raise RuntimeError("Tessellated SDF boundary evaluation did not produce signed distances")
+
+        print(
+            "PASS boundary_evaluation_mode analytical_type={} sdf_forced={} sdf_unique={}".format(
+                getattr(analytical_boundary, "TypeId", ""),
+                bool(getattr(tessellated_boundary, "ForceTessellatedBoundary", False)),
+                len(np.unique(np.round(np.abs(sdf_field), 4))),
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def run_analytical_csg_boundary_case():
+    import numpy as np
+
+    doc = App.newDocument("TPMS_analytical_csg_boundary_test")
+    try:
+        box = doc.addObject("Part::Box", "Box")
+        box.Length = 8.0
+        box.Width = 8.0
+        box.Height = 8.0
+        box.Placement.Base = App.Vector(-4.0, -4.0, -4.0)
+
+        sphere = doc.addObject("Part::Sphere", "Sphere")
+        sphere.Radius = 5.0
+
+        fuse = doc.addObject("Part::Fuse", "Box_Fuse_Sphere")
+        fuse.Base = box
+        fuse.Tool = sphere
+
+        common = doc.addObject("Part::Common", "Box_Common_Sphere")
+        common.Base = box
+        common.Tool = sphere
+
+        cut = doc.addObject("Part::Cut", "Box_Cut_Sphere")
+        cut.Base = box
+        cut.Tool = sphere
+        moved_fuse = doc.addObject("Part::MultiFuse", "Moved_Box_Fuse_Sphere")
+        moved_fuse.Shapes = [box, sphere]
+        moved_fuse.Placement.Base = App.Vector(-11.0, 0.0, 0.0)
+        doc.recompute()
+
+        wx = np.array([0.0, 3.8, 5.5], dtype=float).reshape((3, 1, 1))
+        wy = np.array([0.0, 3.8, 0.0], dtype=float).reshape((3, 1, 1))
+        wz = np.zeros_like(wx)
+        box_field = tpms_generator._primitive_analytic_boundary_field(box, wx, wy, wz)
+        sphere_field = tpms_generator._primitive_analytic_boundary_field(sphere, wx, wy, wz)
+        fuse_field = tpms_generator._analytic_boundary_field(fuse, wx, wy, wz)
+        common_field = tpms_generator._analytic_boundary_field(common, wx, wy, wz)
+        cut_field = tpms_generator._analytic_boundary_field(cut, wx, wy, wz)
+
+        if fuse_field is None or common_field is None or cut_field is None:
+            raise RuntimeError("Analytical CSG did not return fields for all Boolean operations")
+        if not np.allclose(fuse_field, np.maximum(box_field, sphere_field)):
+            raise RuntimeError("Analytical CSG fuse did not use positive-inside union")
+        if not np.allclose(common_field, np.minimum(box_field, sphere_field)):
+            raise RuntimeError("Analytical CSG common did not use positive-inside intersection")
+        if not np.allclose(cut_field, np.minimum(box_field, -sphere_field)):
+            raise RuntimeError("Analytical CSG cut did not use positive-inside subtraction")
+        if not (cut_field[0, 0, 0] < 0.0 and cut_field[1, 0, 0] > 0.0 and cut_field[2, 0, 0] < 0.0):
+            raise RuntimeError("Analytical CSG cut point classification is wrong: {}".format(cut_field.ravel().tolist()))
+
+        moved_wx = np.array([-11.0, -0.5], dtype=float).reshape((2, 1, 1))
+        moved_wy = np.zeros_like(moved_wx)
+        moved_wz = np.array([0.0, 5.0], dtype=float).reshape((2, 1, 1))
+        moved_field = tpms_generator._analytic_boundary_field(moved_fuse, moved_wx, moved_wy, moved_wz)
+        if moved_field is None or not (moved_field[0, 0, 0] > 0.0 and moved_field[1, 0, 0] < 0.0):
+            raise RuntimeError(
+                "Analytical CSG did not respect Boolean object placement: {}".format(
+                    None if moved_field is None else moved_field.ravel().tolist()
+                )
+            )
+
+        print(
+            "PASS analytical_csg_boundary fuse={} common={} cut={} moved={}".format(
+                [round(float(value), 4) for value in fuse_field.ravel()],
+                [round(float(value), 4) for value in common_field.ravel()],
+                [round(float(value), 4) for value in cut_field.ravel()],
+                [round(float(value), 4) for value in moved_field.ravel()],
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def _make_tube_shell(inner_radius, outer_radius, height):
+    import Part
+
+    outer = Part.makeCylinder(
+        float(outer_radius),
+        float(height),
+        App.Vector(0.0, 0.0, 0.0),
+        App.Vector(0.0, 0.0, 1.0),
+    )
+    inner = Part.makeCylinder(
+        float(inner_radius),
+        float(height) + 2.0,
+        App.Vector(0.0, 0.0, -1.0),
+        App.Vector(0.0, 0.0, 1.0),
+    )
+    return outer.cut(inner)
+
+
+class TubeFeature:
+    pass
+
+
+class FeatureBooleanFragments:
+    Type = "FeatureBooleanFragments"
+
+
+class _AnalyticalTubeProbe:
+    TypeId = "Part::FeaturePython"
+
+    def __init__(self, name, inner_radius, outer_radius, height):
+        self.Name = name
+        self.Label = name
+        self.Proxy = TubeFeature()
+        self.Placement = App.Placement()
+        self.InnerRadius = float(inner_radius)
+        self.OuterRadius = float(outer_radius)
+        self.Height = float(height)
+        self.Shape = _make_tube_shell(inner_radius, outer_radius, height)
+
+
+class _BooleanFragmentsProbe:
+    TypeId = "Part::FeaturePython"
+
+    def __init__(self, objects):
+        import Part
+
+        self.Name = "Tube_BooleanFragments"
+        self.Label = "Tube BooleanFragments"
+        self.Proxy = FeatureBooleanFragments()
+        self.Placement = App.Placement()
+        self.Objects = list(objects)
+        self.Shape = Part.makeCompound([obj.Shape.Solids[0] for obj in objects])
+
+
+def run_cylindrical_analytical_csg_tube_boundary_case():
+    import numpy as np
+    import Part
+
+    doc = App.newDocument("TPMS_cylindrical_analytical_csg_tube_test")
+    try:
+        outer = doc.addObject("Part::Cylinder", "Outer_Cylinder")
+        outer.Radius = 7.0
+        outer.Height = 10.0
+
+        inner = doc.addObject("Part::Cylinder", "Inner_Cylinder")
+        inner.Radius = 1.0
+        inner.Height = 12.0
+        inner.Placement.Base = App.Vector(0.0, 0.0, -1.0)
+
+        tube = doc.addObject("Part::Cut", "Analytical_Tube")
+        tube.Base = outer
+        tube.Tool = inner
+        doc.recompute()
+
+        sample_x = np.array([0.5, 2.0, 8.0], dtype=float).reshape((3, 1, 1))
+        sample_y = np.zeros_like(sample_x)
+        sample_z = np.full_like(sample_x, 5.0)
+        field = tpms_generator._analytic_boundary_field(tube, sample_x, sample_y, sample_z)
+        if field is None:
+            raise RuntimeError("Tube Part::Cut did not produce an analytical CSG boundary field")
+        values = field.ravel().tolist()
+        if not (values[0] < 0.0 and values[1] > 0.0 and values[2] < 0.0):
+            raise RuntimeError("Tube analytical CSG field classified sample points incorrectly: {}".format(values))
+
+        polydata = tpms_generator.generate_cylindrical_ring_polydata(
+            tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+            tpms_generator.PART_SHEET,
+            (4.0, 2.0, 5.0),
+            8,
+            0.35,
+            (0.0, 0.0, 0.0),
+            True,
+            (0.0, 0.0, 0.0),
+            None,
+            1.0,
+            7.0,
+            10.0,
+            10,
+            boundary_mode=tpms_generator.BOUNDARY_SELECTED_SOLID,
+            boundary_object=tube,
+        )
+        if polydata.n_points <= 0 or polydata.n_cells <= 0:
+            raise RuntimeError("Cylindrical analytical CSG tube boundary generated empty polydata")
+        mesh = tpms_generator.polydata_to_freecad_mesh(polydata)
+        if mesh.hasNonManifolds():
+            raise RuntimeError("Cylindrical analytical CSG tube boundary generated non-manifold mesh")
+        print(
+            "PASS cylindrical_analytical_csg_tube_boundary facets={} field={}".format(
+                int(mesh.CountFacets),
+                [round(float(value), 4) for value in values],
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def run_basic_tube_boolean_fragments_analytical_case():
+    import numpy as np
+
+    tubes = [
+        _AnalyticalTubeProbe("TubeA", 2.0, 5.0, 10.0),
+        _AnalyticalTubeProbe("TubeB", 5.0, 6.0, 10.0),
+    ]
+    fragments = _BooleanFragmentsProbe(tubes)
+    items = boundary_region_items(fragments)
+    if len(items) != 2:
+        raise RuntimeError("Analytical tube BooleanFragments did not expose two regions")
+    mapped = [getattr(item.get("analytical_object"), "Name", None) for item in items]
+    if mapped != ["TubeA", "TubeB"]:
+        raise RuntimeError("Analytical tube regions did not map back to source tubes: {}".format(mapped))
+
+    coords = np.array([1.0, 3.0, 5.5, 7.0], dtype=float).reshape((4, 1, 1))
+    zeros = np.zeros_like(coords)
+    z = np.full_like(coords, 5.0)
+    fragment_field = tpms_generator._analytic_boundary_field(fragments, coords, zeros, z, 0.0, 8)
+    if fragment_field is None:
+        raise RuntimeError("BooleanFragments tube union did not produce an analytical field")
+    field_values = [round(float(value), 4) for value in fragment_field.ravel()]
+    if not (field_values[0] < 0.0 and field_values[1] > 0.0 and field_values[2] > 0.0 and field_values[3] < 0.0):
+        raise RuntimeError("Analytical tube BooleanFragments classified points incorrectly: {}".format(field_values))
+
+    region_specs = [
+        {
+            "index": int(item["index"]),
+            "boundary_object": item["analytical_object"],
+            "surface": "Gyroid",
+            "part": tpms_generator.PART_SHEET,
+            "equation": tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+            "offset": 0.35,
+            "base_density": 1.0,
+        }
+        for item in items
+    ]
+    polydata = tpms_generator.generate_hybrid_polydata(
+        tpms_generator.SURFACE_EQUATIONS["Gyroid"],
+        tpms_generator.PART_SHEET,
+        (4.0, 2.0, 5.0),
+        (1, 1, 1),
+        8,
+        0.35,
+        (0.0, 0.0, 0.0),
+        tpms_generator.BOUNDARY_SELECTED_SOLID,
+        fragments,
+        0.0,
+        True,
+        (0.0, 0.0, 0.0),
+        None,
+        1.0,
+        region_specs,
+        [],
+        [],
+        coordinate_mode=tpms_generator.COORDINATE_CYLINDRICAL_RING,
+        ring_angular_cells=10,
+    )
+    mesh = tpms_generator.polydata_to_freecad_mesh(polydata)
+    if mesh.CountFacets <= 0 or mesh.hasNonManifolds():
+        raise RuntimeError(
+            "Analytical tube BooleanFragments generated invalid mesh: facets={} non_manifold={}".format(
+                int(mesh.CountFacets),
+                bool(mesh.hasNonManifolds()),
+            )
+        )
+    print(
+        "PASS basic_tube_boolean_fragments_analytical mapped={} facets={} solid={} field={}".format(
+            mapped,
+            int(mesh.CountFacets),
+            bool(mesh.isSolid()),
+            field_values,
+        )
+    )
+
+
+def run_cylindrical_multitube_fragment_case():
+    import Part
+
+    doc = App.newDocument("TPMS_cylindrical_multitube_fragment_test")
+    try:
+        regions = [
+            _make_tube_shell(1.0, 3.0, 10.0),
+            _make_tube_shell(3.0, 5.0, 10.0),
+            _make_tube_shell(5.0, 7.0, 10.0),
+        ]
+        boundary = doc.addObject("Part::Feature", "Cylindrical_Multitube_BooleanFragments")
+        boundary.Label = "Cylindrical Multitube BooleanFragments Equivalent"
+        boundary.Shape = Part.makeCompound(regions)
+        doc.recompute()
+
+        test_path = os.path.join(STUDY_DIR, "cylindrical_multitube_boolean_fragments.FCStd")
+        doc.saveAs(test_path)
+
+        items = boundary_region_items(boundary)
+        if len(items) != 3:
+            raise RuntimeError("Expected 3 tube regions, got {}".format(len(items)))
+
+        _container, controller, _mesh_obj = make_tpms_unit_cell(doc)
+        _configure_fast(controller, boundary)
+        controller.Resolution = 8
+        controller.AddCaps = True
+        controller.CoordinateMode = tpms_generator.COORDINATE_CYLINDRICAL_RING
+        controller.CellSize = App.Vector(4.0, 2.0, 5.0)
+        controller.RingRadius = 1.0
+        controller.RingOuterRadius = 7.0
+        controller.RingHeight = 10.0
+        controller.RingAngularCells = 10
+        controller.BoundaryEvaluation = tpms_generator.BOUNDARY_EVALUATION_ANALYTICAL
+        created = add_tpms_region_settings_for_all_regions(controller, skip_existing=True)
+        if len(created) != 2:
+            raise RuntimeError("Expected 2 added tube-region settings, got {}".format(len(created)))
+
+        doc.recompute()
+        mesh_obj = controller.ResultMesh
+        if mesh_obj is None or mesh_obj.Mesh.CountFacets <= 0:
+            raise RuntimeError("Cylindrical multitube fragment generated an empty mesh")
+        non_manifold = bool(mesh_obj.Mesh.hasNonManifolds())
+        degenerate = bool(_has_degenerate_facets(mesh_obj.Mesh))
+        print(
+            "PASS cylindrical_multitube_fragment regions={} created={} facets={} solid={} non_manifold={} degenerate={} file={}".format(
+                len(items),
+                len(created),
+                int(mesh_obj.Mesh.CountFacets),
+                bool(mesh_obj.Mesh.isSolid()),
+                non_manifold,
+                degenerate,
+                test_path,
+            )
+        )
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def run_harmonic_density_count_mode_case():
     import hashlib
 
@@ -727,6 +1198,13 @@ def main():
     run_transition_region_surface_modes_case()
     run_cylindrical_ring_boundary_origin_case()
     run_cylindrical_ring_radial_continuity_case()
+    run_hybrid_cylindrical_coordinate_mode_case()
+    run_tessellated_boundary_signed_distance_case()
+    run_boundary_evaluation_mode_case()
+    run_analytical_csg_boundary_case()
+    run_cylindrical_analytical_csg_tube_boundary_case()
+    run_basic_tube_boolean_fragments_analytical_case()
+    run_cylindrical_multitube_fragment_case()
     run_harmonic_density_count_mode_case()
 
 
