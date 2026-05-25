@@ -61,7 +61,7 @@ regions.
 
 ### Transition Blend Modes
 
-Transition regions support two blend modes:
+Transition regions support three blend modes:
 
 - `Offset Surface Interpolation`: blends the valid TPMS material interval for
   each part type.  For example, a sheet is treated as the interval around the
@@ -76,6 +76,11 @@ Transition regions support two blend modes:
   direct signed-field blending can cancel near the midpoint of the transition,
   which may create torn or abrupt-looking meshes.  In that case, choose
   `Offset Surface Interpolation` explicitly.
+- `Sigmoid blend`: blends the same signed implicit material fields as
+  `Morphological signed-field blend`, but remaps the transition weight through
+  a normalized sigmoid curve.  This keeps more of each endpoint structure near
+  the transition boundaries and makes the blend change faster near the middle
+  of the transition region.
 
 ## Cylindrical Rings
 

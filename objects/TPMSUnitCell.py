@@ -73,6 +73,9 @@ def make_tpms_unit_cell(doc=None):
     controller.TransitionSourceRegion = 0
     controller.TransitionTargetRegion = 0
     controller.TransitionBlendMode = tpms_generator.TRANSITION_BLEND_THRESHOLD
+    controller.TransitionSourceLabyrinth = tpms_generator.LABYRINTH_AUTO
+    controller.TransitionTargetLabyrinth = tpms_generator.LABYRINTH_AUTO
+    controller.TransitionTopologyMode = tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE
     controller.Sampling = 0.0
     controller.AddCaps = True
     controller.MeshRelaxation = False
@@ -514,15 +517,44 @@ class TPMSUnitCell:
         obj.TransitionBlendMode = [
             tpms_generator.TRANSITION_BLEND_THRESHOLD,
             tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+            tpms_generator.TRANSITION_BLEND_SIGMOID,
         ]
         if current_transition_blend == "Threshold interval blend":
             current_transition_blend = tpms_generator.TRANSITION_BLEND_THRESHOLD
         if current_transition_blend not in (
             tpms_generator.TRANSITION_BLEND_THRESHOLD,
             tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+            tpms_generator.TRANSITION_BLEND_SIGMOID,
         ):
             current_transition_blend = tpms_generator.TRANSITION_BLEND_THRESHOLD
         obj.TransitionBlendMode = current_transition_blend
+        if not hasattr(obj, "TransitionSourceLabyrinth"):
+            obj.addProperty("App::PropertyEnumeration", "TransitionSourceLabyrinth", "Transition", "Source labyrinth for skeletal transition regions")
+        current_source_labyrinth = str(getattr(obj, "TransitionSourceLabyrinth", tpms_generator.LABYRINTH_AUTO))
+        obj.TransitionSourceLabyrinth = tpms_generator.labyrinth_modes()
+        obj.TransitionSourceLabyrinth = (
+            current_source_labyrinth
+            if current_source_labyrinth in tpms_generator.labyrinth_modes()
+            else tpms_generator.LABYRINTH_AUTO
+        )
+        if not hasattr(obj, "TransitionTargetLabyrinth"):
+            obj.addProperty("App::PropertyEnumeration", "TransitionTargetLabyrinth", "Transition", "Target labyrinth for skeletal transition regions")
+        current_target_labyrinth = str(getattr(obj, "TransitionTargetLabyrinth", tpms_generator.LABYRINTH_AUTO))
+        obj.TransitionTargetLabyrinth = tpms_generator.labyrinth_modes()
+        obj.TransitionTargetLabyrinth = (
+            current_target_labyrinth
+            if current_target_labyrinth in tpms_generator.labyrinth_modes()
+            else tpms_generator.LABYRINTH_AUTO
+        )
+        if not hasattr(obj, "TransitionTopologyMode"):
+            obj.addProperty("App::PropertyEnumeration", "TransitionTopologyMode", "Transition", "How selected source and target labyrinths connect")
+        current_topology = str(getattr(obj, "TransitionTopologyMode", tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE))
+        obj.TransitionTopologyMode = tpms_generator.transition_topology_modes()
+        obj.TransitionTopologyMode = (
+            current_topology
+            if current_topology in tpms_generator.transition_topology_modes()
+            else tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE
+        )
         if not hasattr(obj, "RegionCount"):
             obj.addProperty("App::PropertyInteger", "RegionCount", "Result", "Detected solid region count in the boundary")
             obj.setEditorMode("RegionCount", 1)
@@ -1118,6 +1150,9 @@ def _hybrid_transition_region_specs(base, items):
                 "target_offset": float(getattr(target_setting, "Offset", getattr(base, "Offset", 0.3))),
                 "target_base_density": max(0.05, float(getattr(target_setting, "BaseDensity", getattr(base, "BaseDensity", 1.0)))),
                 "blend": str(getattr(setting, "TransitionBlendMode", tpms_generator.TRANSITION_BLEND_THRESHOLD)),
+                "source_labyrinth": str(getattr(setting, "TransitionSourceLabyrinth", tpms_generator.LABYRINTH_AUTO)),
+                "target_labyrinth": str(getattr(setting, "TransitionTargetLabyrinth", tpms_generator.LABYRINTH_AUTO)),
+                "topology": str(getattr(setting, "TransitionTopologyMode", tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE)),
             }
         )
     return specs

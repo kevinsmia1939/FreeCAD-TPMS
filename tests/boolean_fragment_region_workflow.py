@@ -389,7 +389,16 @@ def run_region_grading_separation_case():
         App.closeDocument(doc.Name)
 
 
-def _hybrid_transition_polydata(source_surface, source_part, target_surface, target_part, blend_mode=None):
+def _hybrid_transition_polydata(
+    source_surface,
+    source_part,
+    target_surface,
+    target_part,
+    blend_mode=None,
+    source_labyrinth=None,
+    target_labyrinth=None,
+    topology=None,
+):
     import Part
 
     solids = [
@@ -461,6 +470,9 @@ def _hybrid_transition_polydata(source_surface, source_part, target_surface, tar
                 "target_offset": 0.65,
                 "target_base_density": 1.2,
                 "blend": blend_mode or tpms_generator.TRANSITION_BLEND_THRESHOLD,
+                "source_labyrinth": source_labyrinth or tpms_generator.LABYRINTH_AUTO,
+                "target_labyrinth": target_labyrinth or tpms_generator.LABYRINTH_AUTO,
+                "topology": topology or tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE,
             },
         ],
     )
@@ -527,6 +539,92 @@ def run_transition_region_surface_modes_case():
             int(solid_mesh.CountFacets),
             int(lower_mesh.CountFacets),
             int(upper_sheet_mesh.CountFacets),
+        )
+    )
+
+
+def run_labyrinth_transition_modes_case():
+    import hashlib
+
+    def signature(mesh):
+        sample = [
+            (round(point.x, 5), round(point.y, 5), round(point.z, 5))
+            for point in mesh.Points[:1000]
+        ]
+        return int(mesh.CountFacets), hashlib.sha256(repr(sample).encode("utf-8")).hexdigest()[:16]
+
+    same_side = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        target_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        topology=tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE,
+    )
+    same_mesh = _assert_valid_polydata("Upper-to-upper labyrinth transition", same_side)
+
+    cross_side = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        "Gyroid",
+        tpms_generator.PART_LOWER,
+        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
+        topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
+    )
+    cross_mesh = _assert_valid_polydata("Upper-to-lower labyrinth transition", cross_side)
+
+    same_signature = signature(same_mesh)
+    cross_signature = signature(cross_mesh)
+    if same_signature == cross_signature:
+        raise RuntimeError("Same-side and cross-labyrinth transitions produced identical signatures")
+    offset_blend = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        "Gyroid",
+        tpms_generator.PART_LOWER,
+        blend_mode=tpms_generator.TRANSITION_BLEND_THRESHOLD,
+        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
+        topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
+    )
+    signed_blend = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        "Gyroid",
+        tpms_generator.PART_LOWER,
+        blend_mode=tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
+        topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
+    )
+    sigmoid_blend = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        "Gyroid",
+        tpms_generator.PART_LOWER,
+        blend_mode=tpms_generator.TRANSITION_BLEND_SIGMOID,
+        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
+        topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
+    )
+    offset_signature = signature(_assert_valid_polydata("Cross-labyrinth offset-surface blend", offset_blend))
+    signed_signature = signature(_assert_valid_polydata("Cross-labyrinth signed-field blend", signed_blend))
+    sigmoid_signature = signature(_assert_valid_polydata("Cross-labyrinth sigmoid blend", sigmoid_blend))
+    if offset_signature == signed_signature:
+        raise RuntimeError("Transition blend modes produced identical signatures")
+    if sigmoid_signature in (offset_signature, signed_signature):
+        raise RuntimeError("Sigmoid transition blend matched an existing blend signature")
+    print(
+        "PASS labyrinth_transition_modes same_facets={} same_hash={} cross_facets={} cross_hash={} offset_hash={} signed_hash={} sigmoid_hash={}".format(
+            same_signature[0],
+            same_signature[1],
+            cross_signature[0],
+            cross_signature[1],
+            offset_signature[1],
+            signed_signature[1],
+            sigmoid_signature[1],
         )
     )
 
@@ -1196,6 +1294,7 @@ def main():
     run_generated_transition_region_case()
     run_region_grading_separation_case()
     run_transition_region_surface_modes_case()
+    run_labyrinth_transition_modes_case()
     run_cylindrical_ring_boundary_origin_case()
     run_cylindrical_ring_radial_continuity_case()
     run_hybrid_cylindrical_coordinate_mode_case()

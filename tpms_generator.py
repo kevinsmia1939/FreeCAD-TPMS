@@ -44,6 +44,12 @@ HARMONIC_BOUNDARY_CONDUCTOR = "Conductor"
 HARMONIC_BOUNDARY_INSULATOR = "Insulator"
 TRANSITION_BLEND_THRESHOLD = "Offset Surface Interpolation"
 TRANSITION_BLEND_SIGNED_FIELD = "Morphological signed-field blend"
+TRANSITION_BLEND_SIGMOID = "Sigmoid blend"
+LABYRINTH_AUTO = "Auto"
+LABYRINTH_POSITIVE = "Upper labyrinth"
+LABYRINTH_NEGATIVE = "Lower labyrinth"
+TRANSITION_TOPOLOGY_SAME_SIDE = "Same-side signed blend"
+TRANSITION_TOPOLOGY_CROSS_BRIDGE = "Cross-labyrinth bridge"
 
 _BOUNDARY_FIELD_CACHE = {}
 _BOUNDARY_FIELD_CACHE_ORDER = []
@@ -116,6 +122,14 @@ def boundary_evaluation_modes():
 
 def coordinate_modes():
     return [COORDINATE_CARTESIAN, COORDINATE_CYLINDRICAL_RING]
+
+
+def labyrinth_modes():
+    return [LABYRINTH_AUTO, LABYRINTH_POSITIVE, LABYRINTH_NEGATIVE]
+
+
+def transition_topology_modes():
+    return [TRANSITION_TOPOLOGY_SAME_SIDE, TRANSITION_TOPOLOGY_CROSS_BRIDGE]
 
 
 def _make_axis(minimum, maximum, default_count):
@@ -713,6 +727,32 @@ def _smooth_falloff_weight(distance, transition):
 def _smoothstep(t):
     t = np.clip(t, 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
+
+
+def _sigmoidstep(t, sharpness=10.0):
+    t = np.clip(t, 0.0, 1.0)
+    low = 1.0 / (1.0 + math.exp(0.5 * sharpness))
+    high = 1.0 / (1.0 + math.exp(-0.5 * sharpness))
+    value = 1.0 / (1.0 + np.exp(-sharpness * (t - 0.5)))
+    return np.clip((value - low) / (high - low), 0.0, 1.0)
+
+
+def _labyrinth_sign(labyrinth, part_name):
+    mode = str(labyrinth or LABYRINTH_AUTO)
+    part_name = str(part_name)
+    if mode == LABYRINTH_POSITIVE:
+        return 1.0
+    if mode == LABYRINTH_NEGATIVE:
+        return -1.0
+    if part_name == PART_UPPER:
+        return 1.0
+    if part_name == PART_LOWER:
+        return -1.0
+    return None
+
+
+def _is_skeletal_part(part_name):
+    return str(part_name) in (PART_UPPER, PART_LOWER)
 
 
 def _blend_equation_field(base_field, x, y, z, wx, wy, wz, equation_blend_controls=None):
@@ -2076,6 +2116,48 @@ def generate_hybrid_polydata(
         upper = (1.0 - blend_weight) * source_upper + blend_weight * target_upper
         return np.minimum(blend_values - lower, upper - blend_values)
 
+    def transition_weight(raw_weight, blend_mode):
+        if str(blend_mode) == TRANSITION_BLEND_SIGMOID:
+            return _sigmoidstep(raw_weight)
+        return _smoothstep(raw_weight)
+
+    def skeletal_part_for_labyrinth(part_name, labyrinth):
+        if not _is_skeletal_part(part_name):
+            return str(part_name)
+        sign = _labyrinth_sign(labyrinth, part_name)
+        if sign is None:
+            return str(part_name)
+        return PART_UPPER if sign > 0.0 else PART_LOWER
+
+    def cross_labyrinth_bridge_material(
+        source_values,
+        target_values,
+        offset_values,
+        blend_weight,
+        source_part,
+        target_part,
+        source_labyrinth,
+        target_labyrinth,
+        topology_mode,
+        source_surface="",
+        target_surface="",
+    ):
+        if str(source_surface) in (SURFACE_EMPTY, SURFACE_SOLID_FILL) or str(target_surface) in (SURFACE_EMPTY, SURFACE_SOLID_FILL):
+            return None
+        if not (_is_skeletal_part(source_part) and _is_skeletal_part(target_part)):
+            return None
+        if str(topology_mode or TRANSITION_TOPOLOGY_SAME_SIDE) != TRANSITION_TOPOLOGY_CROSS_BRIDGE:
+            return None
+        source_sign = _labyrinth_sign(source_labyrinth, source_part)
+        target_sign = _labyrinth_sign(target_labyrinth, target_part)
+        if source_sign is None or target_sign is None or source_sign == target_sign:
+            return None
+        offset_values = np.asarray(offset_values, dtype=float)
+        half_offset = 0.5 * offset_values
+        blend_values = (1.0 - blend_weight) * source_values + blend_weight * target_values
+        bridge_peak = 4.0 * blend_weight * (1.0 - blend_weight)
+        return bridge_peak * half_offset - np.abs(blend_values)
+
     def material_for_spec(spec, equation_key="equation", density_key="base_density", offset_key="offset", part_key="part", surface_key="surface"):
         surface_mode = str(spec.get(surface_key, spec.get("surface", "")))
         offset_value = float(spec.get(offset_key, offset))
@@ -2138,7 +2220,8 @@ def generate_hybrid_polydata(
             out=np.full(field.shape, 0.5, dtype=float),
             where=np.isfinite(denom) & (denom > 1e-12),
         )
-        t = _smoothstep(np.clip(t, 0.0, 1.0))
+        blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+        t = transition_weight(t, blend_mode)
         field[mask] = ((1.0 - t) * source_field + t * target_field)[mask]
         source_offset = float(spec.get("source_offset", offset))
         target_offset = float(spec.get("target_offset", offset))
@@ -2235,27 +2318,58 @@ def generate_hybrid_polydata(
             out=np.full(field.shape, 0.5, dtype=float),
             where=np.isfinite(denom) & (denom > 1e-12),
         )
-        t = _smoothstep(np.clip(t, 0.0, 1.0))
         blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+        t = transition_weight(t, blend_mode)
         source_part = str(spec.get("source_part", part))
         target_part = str(spec.get("target_part", part))
-        if blend_mode == TRANSITION_BLEND_SIGNED_FIELD:
-            material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
+        source_labyrinth = str(spec.get("source_labyrinth", LABYRINTH_AUTO))
+        target_labyrinth = str(spec.get("target_labyrinth", LABYRINTH_AUTO))
+        topology_mode = str(spec.get("topology", TRANSITION_TOPOLOGY_SAME_SIDE))
+        effective_source_part = skeletal_part_for_labyrinth(source_part, source_labyrinth)
+        effective_target_part = skeletal_part_for_labyrinth(target_part, target_labyrinth)
+        source_material = material_from_field(
+            source_field,
+            offset_field,
+            effective_source_part,
+            str(spec.get("source_surface", "")),
+        )
+        target_material = material_from_field(
+            target_field,
+            offset_field,
+            effective_target_part,
+            str(spec.get("target_surface", "")),
+        )
+        if blend_mode in (TRANSITION_BLEND_SIGNED_FIELD, TRANSITION_BLEND_SIGMOID):
+            blended_material = ((1.0 - t) * source_material + t * target_material)
         else:
-            part_transition_material = transition_material_from_parts(
+            blended_material = transition_material_from_parts(
                 source_field,
                 target_field,
                 offset_field,
                 t,
-                source_part,
-                target_part,
+                effective_source_part,
+                effective_target_part,
                 str(spec.get("source_surface", "")),
                 str(spec.get("target_surface", "")),
             )
-            if part_transition_material is not None:
-                material_field[mask] = part_transition_material[mask]
-            else:
-                material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
+            if blended_material is None:
+                blended_material = ((1.0 - t) * source_material + t * target_material)
+        bridge_material = cross_labyrinth_bridge_material(
+            source_field,
+            target_field,
+            offset_field,
+            t,
+            source_part,
+            target_part,
+            source_labyrinth,
+            target_labyrinth,
+            topology_mode,
+            str(spec.get("source_surface", "")),
+            str(spec.get("target_surface", "")),
+        )
+        if bridge_material is not None:
+            blended_material = np.maximum(blended_material, bridge_material)
+        material_field[mask] = blended_material[mask]
 
     grid["surface"] = field.ravel(order="F")
     grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")

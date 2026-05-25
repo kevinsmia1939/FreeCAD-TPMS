@@ -121,10 +121,10 @@ class TPMSTaskPanel:
 
         transition_group = self._group(layout, "Transition")
 
-        self.transition_source = self._spin(max(0, int(getattr(obj, "TransitionSourceRegion", 0))), 0, 100000)
+        self.transition_source = self._spin(self._display_region_index(getattr(obj, "TransitionSourceRegion", 0)), 1, 100000)
         transition_group.addRow("Source region", self.transition_source)
 
-        self.transition_target = self._spin(max(0, int(getattr(obj, "TransitionTargetRegion", 0))), 0, 100000)
+        self.transition_target = self._spin(self._display_region_index(getattr(obj, "TransitionTargetRegion", 0)), 1, 100000)
         transition_group.addRow("Target region", self.transition_target)
 
         self.transition_blend_mode = QtWidgets.QComboBox()
@@ -132,12 +132,34 @@ class TPMSTaskPanel:
             [
                 tpms_generator.TRANSITION_BLEND_THRESHOLD,
                 tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+                tpms_generator.TRANSITION_BLEND_SIGMOID,
             ]
         )
         self.transition_blend_mode.setCurrentText(
             str(getattr(obj, "TransitionBlendMode", tpms_generator.TRANSITION_BLEND_THRESHOLD))
         )
         transition_group.addRow("Blend mode", self.transition_blend_mode)
+
+        self.transition_source_labyrinth = QtWidgets.QComboBox()
+        self.transition_source_labyrinth.addItems(tpms_generator.labyrinth_modes())
+        self.transition_source_labyrinth.setCurrentText(
+            str(getattr(obj, "TransitionSourceLabyrinth", tpms_generator.LABYRINTH_AUTO))
+        )
+        transition_group.addRow("Source labyrinth", self.transition_source_labyrinth)
+
+        self.transition_target_labyrinth = QtWidgets.QComboBox()
+        self.transition_target_labyrinth.addItems(tpms_generator.labyrinth_modes())
+        self.transition_target_labyrinth.setCurrentText(
+            str(getattr(obj, "TransitionTargetLabyrinth", tpms_generator.LABYRINTH_AUTO))
+        )
+        transition_group.addRow("Target labyrinth", self.transition_target_labyrinth)
+
+        self.transition_topology_mode = QtWidgets.QComboBox()
+        self.transition_topology_mode.addItems(tpms_generator.transition_topology_modes())
+        self.transition_topology_mode.setCurrentText(
+            str(getattr(obj, "TransitionTopologyMode", tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE))
+        )
+        transition_group.addRow("Topology", self.transition_topology_mode)
 
         density_group = self._group(layout, "Grading")
 
@@ -387,6 +409,12 @@ class TPMSTaskPanel:
         widget.setStatusTip(text)
         widget.setWhatsThis(text)
 
+    def _display_region_index(self, stored_index):
+        return max(1, int(stored_index) + 1)
+
+    def _stored_region_index(self, displayed_index):
+        return max(0, int(displayed_index) - 1)
+
     def _set_tooltips(self):
         self._set_tip(self.surface, "Preset TPMS equation. Choose Custom to edit the equation directly.")
         self._set_tip(self.equation, "Implicit equation evaluated with x, y, and z. The zero level set defines the TPMS.")
@@ -411,11 +439,14 @@ class TPMSTaskPanel:
         self._set_tip(self.region_mode, "For BooleanFragments or compounds with multiple solids, choose whether this TPMS parameter fills all regions or one solid region.")
         self._set_tip(self.region_index, "Solid region used when Boundary regions is set to Single region. Region order comes from the FreeCAD shape solids.")
         self._set_tip(self.region_role, "Base is the first region setting. Override defines one fixed TPMS region. Transition blends source and target TPMS fields inside this region.")
-        self._set_tip(self.transition_source, "Source region index for this transition region.")
-        self._set_tip(self.transition_target, "Target region index for this transition region.")
+        self._set_tip(self.transition_source, "Source region number for this transition region. Region numbering starts at 1.")
+        self._set_tip(self.transition_target, "Target region number for this transition region. Region numbering starts at 1.")
+        self._set_tip(self.transition_source_labyrinth, "Source labyrinth to connect. Auto follows upper or lower skeletal part.")
+        self._set_tip(self.transition_target_labyrinth, "Target labyrinth to connect. Auto follows upper or lower skeletal part.")
+        self._set_tip(self.transition_topology_mode, "Same-side blends selected labyrinths directly. Cross-labyrinth bridge adds material near the TPMS mid-surface to create a passage.")
         self._set_tip(
             self.transition_blend_mode,
-            "Offset Surface Interpolation blends TPMS part thresholds. Morphological signed-field blends source and target implicit solid fields.",
+            "Offset Surface Interpolation blends TPMS part thresholds. Morphological signed-field blends source and target implicit solid fields. Sigmoid blend uses a steeper S-shaped signed-field transition.",
         )
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
@@ -709,7 +740,13 @@ class TPMSTaskPanel:
         enabled = self.region_role.currentText() == "Transition"
         self._set_enabled(self.transition_source, enabled)
         self._set_enabled(self.transition_target, enabled)
+        region_count = max(1, len(self._region_items()))
+        self.transition_source.setRange(1, region_count)
+        self.transition_target.setRange(1, region_count)
         self._set_enabled(self.transition_blend_mode, enabled)
+        self._set_enabled(self.transition_source_labyrinth, enabled)
+        self._set_enabled(self.transition_target_labyrinth, enabled)
+        self._set_enabled(self.transition_topology_mode, enabled)
         transition_role = self.region_role.currentText() == "Transition"
         for widget in (
             self.surface,
@@ -870,9 +907,12 @@ class TPMSTaskPanel:
             obj.RegionMode = self.region_mode.currentText()
             obj.RegionIndex = int(self.region_index.currentData() or 0)
             obj.RegionRole = self.region_role.currentText()
-            obj.TransitionSourceRegion = int(self.transition_source.value())
-            obj.TransitionTargetRegion = int(self.transition_target.value())
+            obj.TransitionSourceRegion = self._stored_region_index(self.transition_source.value())
+            obj.TransitionTargetRegion = self._stored_region_index(self.transition_target.value())
             obj.TransitionBlendMode = self.transition_blend_mode.currentText()
+            obj.TransitionSourceLabyrinth = self.transition_source_labyrinth.currentText()
+            obj.TransitionTargetLabyrinth = self.transition_target_labyrinth.currentText()
+            obj.TransitionTopologyMode = self.transition_topology_mode.currentText()
             obj.Sampling = float(self.sampling.value())
             obj.AddCaps = bool(self.add_caps.isChecked())
             obj.touch()
@@ -1060,9 +1100,12 @@ class TPMSTaskPanel:
             obj.RegionMode = self.region_mode.currentText()
             obj.RegionIndex = int(self.region_index.currentData() or 0)
             obj.RegionRole = self.region_role.currentText()
-            obj.TransitionSourceRegion = int(self.transition_source.value())
-            obj.TransitionTargetRegion = int(self.transition_target.value())
+            obj.TransitionSourceRegion = self._stored_region_index(self.transition_source.value())
+            obj.TransitionTargetRegion = self._stored_region_index(self.transition_target.value())
             obj.TransitionBlendMode = self.transition_blend_mode.currentText()
+            obj.TransitionSourceLabyrinth = self.transition_source_labyrinth.currentText()
+            obj.TransitionTargetLabyrinth = self.transition_target_labyrinth.currentText()
+            obj.TransitionTopologyMode = self.transition_topology_mode.currentText()
             obj.Sampling = float(self.sampling.value())
             obj.AddCaps = bool(self.add_caps.isChecked())
             obj.MeshRelaxation = bool(self.mesh_relaxation.isChecked())
