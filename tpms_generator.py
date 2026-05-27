@@ -2176,6 +2176,57 @@ def generate_hybrid_polydata(
             return _sigmoidstep(raw_weight)
         return _smoothstep(raw_weight)
 
+    def _edge_transition_distance(edge_points):
+        """
+        Compute the Euclidean distance from each grid voxel to the nearest edge transition point.
+        Uses Scipy's cKDTree for high-performance spatial querying.
+        """
+        from scipy.spatial import cKDTree as KDTree
+        pts = np.column_stack((wx.ravel(), wy.ravel(), wz.ravel()))
+        tree = KDTree(edge_points)
+        dist_flat, _ = tree.query(pts, k=1)
+        return dist_flat.reshape(wx.shape)
+
+    def _edge_transition_weights(adj_specs, distance, blend_radius, blend_mode):
+        """
+        Compute continuous, normalized N-way weights for solid regions meeting at an edge.
+        Ensures C^1 continuity at the edge center and cylinder boundary.
+        
+        Returns:
+            weights: A list of tuples (r_spec, w_k) containing the region spec and its weight array.
+            u: Smoothstepped normalized radial coordinate (1.0 at cylinder boundary, 0.0 at center).
+        """
+        N = len(adj_specs)
+        u = np.clip(distance / blend_radius, 0.0, 1.0)
+        u = transition_weight(u, blend_mode)
+        
+        v_keys = []
+        for r_spec in adj_specs:
+            r_boundary = r_spec.get("boundary_object")
+            if r_boundary is None:
+                # Fallback weight when no boundary object is defined
+                own_mask = (region_index == int(r_spec["index"]))
+                w_k_fallback = np.where(own_mask, 1.0 / N + ((N - 1.0) / N) * u, (1.0 - u) / N)
+                v_keys.append(w_k_fallback)
+            else:
+                dist_k = boundary_distance(r_boundary)
+                inside_k = boundary_mask(r_boundary)
+                d_k = np.where(inside_k, 0.0, dist_k)
+                
+                t_k = np.clip(1.0 - d_k / blend_radius, 0.0, 1.0)
+                v_k = transition_weight(t_k, blend_mode)
+                v_keys.append(v_k)
+        
+        v_sum = sum(v_keys)
+        v_sum = np.where(v_sum > 1e-12, v_sum, 1.0)
+        
+        weights = []
+        for idx, r_spec in enumerate(adj_specs):
+            w_k = v_keys[idx] / v_sum
+            weights.append((r_spec, w_k))
+            
+        return weights, u
+
     def skeletal_part_for_labyrinth(part_name, labyrinth):
         if not _is_skeletal_part(part_name):
             return str(part_name)
@@ -2332,58 +2383,35 @@ def generate_hybrid_polydata(
             continue
             
         try:
-            from scipy.spatial import cKDTree as KDTree
-            pts = np.column_stack((wx.ravel(), wy.ravel(), wz.ravel()))
-            tree = KDTree(edge_points)
-            dist_flat, _ = tree.query(pts, k=1)
-            distance = dist_flat.reshape(wx.shape)
+            # 1. Compute Euclidean distance from each voxel to the transition edge
+            distance = _edge_transition_distance(edge_points)
             
+            # Define the cylindrical region of influence
             blend_mask = transition_mask & (distance <= blend_radius)
             if not np.any(blend_mask):
                 continue
                 
-            N = len(adj_indices)
-            u = np.clip(distance / blend_radius, 0.0, 1.0)
+            # 2. Compute N-way regional blending weights and the radial blend coordinate
             blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
-            u = transition_weight(u, blend_mode)
+            weights, u = _edge_transition_weights(adj_specs, distance, blend_radius, blend_mode)
             
-            # Calculate continuous distances to each region
-            v_keys = []
-            for r_spec in adj_specs:
-                r_boundary = r_spec.get("boundary_object")
-                if r_boundary is None:
-                    own_mask = (region_index == int(r_spec["index"]))
-                    w_k_fallback = np.where(own_mask, 1.0 / N + ((N - 1.0) / N) * u, (1.0 - u) / N)
-                    v_keys.append(w_k_fallback)
-                else:
-                    dist_k = boundary_distance(r_boundary)
-                    inside_k = boundary_mask(r_boundary)
-                    d_k = np.where(inside_k, 0.0, dist_k)
-                    
-                    t_k = np.clip(1.0 - d_k / blend_radius, 0.0, 1.0)
-                    v_k = transition_weight(t_k, blend_mode)
-                    v_keys.append(v_k)
-            
-            v_sum = sum(v_keys)
-            v_sum = np.where(v_sum > 1e-12, v_sum, 1.0)
-            
-            # Capture pre-existing background (includes face transitions)
+            # 3. Capture pre-existing background (which already contains face transitions)
             bg_field = field.copy()
             bg_offset = offset_field.copy()
             
+            # 4. Perform N-way convex combination blending for Phase 1 fields and offsets
             blended_field = np.zeros(field.shape, dtype=float)
             blended_offset = np.zeros(field.shape, dtype=float)
             
-            for idx, r_spec in enumerate(adj_specs):
-                w_k = v_keys[idx] / v_sum
+            for r_spec, w_k in weights:
                 r_field = evaluated_field(r_spec, "equation", "base_density")
                 r_offset = float(r_spec.get("offset", offset))
                 
                 blended_field += w_k * r_field
                 blended_offset += w_k * r_offset
             
-            # Hierarchical blend: smoothly merge edge result with background
-            # w_edge=1 at edge center (d=0), w_edge=0 at cylinder boundary (d=R)
+            # 5. Hierarchical Background Blending: smoothly morph the edge blend 
+            # into the background fields to maintain C^1 continuity at the boundary (d = R).
             w_edge = 1.0 - u
             final_field = w_edge * blended_field + (1.0 - w_edge) * bg_field
             final_offset = w_edge * blended_offset + (1.0 - w_edge) * bg_offset
@@ -2699,12 +2727,10 @@ def generate_hybrid_polydata(
             continue
             
         try:
-            from scipy.spatial import cKDTree as KDTree
-            pts = np.column_stack((wx.ravel(), wy.ravel(), wz.ravel()))
-            tree = KDTree(edge_points)
-            dist_flat, _ = tree.query(pts, k=1)
-            distance = dist_flat.reshape(wx.shape)
+            # 1. Compute Euclidean distance from each voxel to the transition edge
+            distance = _edge_transition_distance(edge_points)
             
+            # Define the cylindrical region of influence
             blend_mask = transition_mask & (distance <= blend_radius)
             if not np.any(blend_mask):
                 App.Console.PrintMessage("[EDGE-DBG] blend_mask is EMPTY, skipping\n")
@@ -2714,43 +2740,16 @@ def generate_hybrid_polydata(
             App.Console.PrintMessage("[EDGE-DBG] adj_indices={}, transition_mask has {} voxels\n".format(adj_indices, int(np.sum(transition_mask))))
             App.Console.PrintMessage("[EDGE-DBG] distance range in blend: {:.4f} to {:.4f}\n".format(float(np.min(distance[blend_mask])), float(np.max(distance[blend_mask]))))
                 
-            N = len(adj_indices)
-            u = np.clip(distance / blend_radius, 0.0, 1.0)
+            # 2. Compute N-way regional blending weights and the radial blend coordinate
             blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
-            u = transition_weight(u, blend_mode)
+            weights, u = _edge_transition_weights(adj_specs, distance, blend_radius, blend_mode)
             
-            # Calculate continuous distances to each region
-            v_keys = []
-            for r_spec in adj_specs:
-                r_boundary = r_spec.get("boundary_object")
-                if r_boundary is None:
-                    own_mask = (region_index == int(r_spec["index"]))
-                    w_k_fallback = np.where(own_mask, 1.0 / N + ((N - 1.0) / N) * u, (1.0 - u) / N)
-                    v_keys.append(w_k_fallback)
-                else:
-                    dist_k = boundary_distance(r_boundary)
-                    inside_k = boundary_mask(r_boundary)
-                    d_k = np.where(inside_k, 0.0, dist_k)
-                    
-                    t_k = np.clip(1.0 - d_k / blend_radius, 0.0, 1.0)
-                    v_k = transition_weight(t_k, blend_mode)
-                    v_keys.append(v_k)
-            
-            v_sum = sum(v_keys)
-            v_sum = np.where(v_sum > 1e-12, v_sum, 1.0)
-            
-            weights = []
-            for idx, r_spec in enumerate(adj_specs):
-                w_k = v_keys[idx] / v_sum
-                weights.append((r_spec, w_k))
-            
-            # Capture pre-existing background material (includes face transitions)
+            # 3. Capture pre-existing background material (includes face transitions)
             bg_material = material_field.copy()
             
-            # Use N-way interval boundary blending for material blending to preserve 
-            # solid regions and avoid voids. We blend the lower and upper bounds of 
+            # 4. Perform N-Way Interval Boundary Blending: We blend the lower and upper bounds of 
             # each adjacent region, then construct the blended material field from 
-            # the already-blended field and these blended bounds.
+            # the already-blended Phase 1 field and these blended bounds.
             blended_lower = np.zeros(material_field.shape, dtype=float)
             blended_upper = np.zeros(material_field.shape, dtype=float)
             for r_spec, w_k in weights:
@@ -2781,7 +2780,7 @@ def generate_hybrid_polydata(
                 
             blended_material = np.minimum(field - blended_lower, blended_upper - field)
             
-            # Hierarchical blend: smoothly merge edge result with background
+            # 5. Hierarchical Background Blending: smoothly merge edge material with background
             # w_edge=1 at edge center (d=0), w_edge=0 at cylinder boundary (d=R)
             w_edge = 1.0 - u
             final_material = w_edge * blended_material + (1.0 - w_edge) * bg_material
