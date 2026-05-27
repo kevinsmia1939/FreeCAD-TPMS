@@ -37,10 +37,10 @@ class TPMSGradingTaskPanel:
         self.capture_btn.clicked.connect(self._capture_selected_faces)
         form.addRow("", self.capture_btn)
 
-        # Affected Regions Section
-        self.regions_group = QtWidgets.QGroupBox("Affected Regions")
-        self.regions_layout = QtWidgets.QVBoxLayout(self.regions_group)
-        self.region_checkboxes = {}  # solid_idx: (checkbox, parameter_obj)
+        # Regions Settings Section
+        self.regions_group = QtWidgets.QGroupBox("Regions Settings")
+        self.regions_grid = QtWidgets.QGridLayout(self.regions_group)
+        self.region_checkboxes = {}  # solid_idx: (affected_cb, negate_cb, parameter_obj)
         form.addRow("", self.regions_group)
         self._refresh_affected_regions()
 
@@ -160,8 +160,9 @@ class TPMSGradingTaskPanel:
 
     def _refresh_affected_regions(self):
         # Clear existing checkboxes
-        for i in reversed(range(self.regions_layout.count())):
-            widget = self.regions_layout.itemAt(i).widget()
+        for i in reversed(range(self.regions_grid.count())):
+            item = self.regions_grid.itemAt(i)
+            widget = item.widget()
             if widget:
                 widget.setParent(None)
         self.region_checkboxes.clear()
@@ -182,6 +183,14 @@ class TPMSGradingTaskPanel:
             return
 
         self.regions_group.setVisible(True)
+
+        # Add headers
+        lbl_region = QtWidgets.QLabel("<b>Region</b>")
+        lbl_affected = QtWidgets.QLabel("<b>Apply Grading</b>")
+        lbl_negated = QtWidgets.QLabel("<b>Negate Thickness</b>")
+        self.regions_grid.addWidget(lbl_region, 0, 0)
+        self.regions_grid.addWidget(lbl_affected, 0, 1, QtCore.Qt.AlignCenter)
+        self.regions_grid.addWidget(lbl_negated, 0, 2, QtCore.Qt.AlignCenter)
 
         # Gather adjacent solid indices for all selected faces
         adj_indices = set()
@@ -211,21 +220,34 @@ class TPMSGradingTaskPanel:
                     except Exception:
                         pass
 
-        # Load currently linked regions from AffectedRegions
+        # Load currently linked regions from AffectedRegions and NegateRegions
         currently_linked = list(getattr(self.obj, "AffectedRegions", []))
+        currently_negated = list(getattr(self.obj, "NegateRegions", []))
 
         # Add checkboxes for each adjacent region
+        row = 1
         for idx in sorted(adj_indices):
             parameter_obj = regions_in_doc.get(idx, base)
             label = "Region {} ({})".format(idx + 1, parameter_obj.Label)
+            lbl = QtWidgets.QLabel(label)
             
-            cb = QtWidgets.QCheckBox(label)
-            # Default to checked if currently_linked is empty or parameter_obj is in it
-            is_checked = len(currently_linked) == 0 or parameter_obj in currently_linked
-            cb.setChecked(is_checked)
+            cb_affected = QtWidgets.QCheckBox()
+            is_affected = len(currently_linked) == 0 or parameter_obj in currently_linked
+            cb_affected.setChecked(is_affected)
             
-            self.regions_layout.addWidget(cb)
-            self.region_checkboxes[idx] = (cb, parameter_obj)
+            cb_negated = QtWidgets.QCheckBox()
+            is_negated = parameter_obj in currently_negated
+            cb_negated.setChecked(is_negated)
+            cb_negated.setEnabled(is_affected)
+            
+            cb_affected.toggled.connect(cb_negated.setEnabled)
+            
+            self.regions_grid.addWidget(lbl, row, 0)
+            self.regions_grid.addWidget(cb_affected, row, 1, QtCore.Qt.AlignCenter)
+            self.regions_grid.addWidget(cb_negated, row, 2, QtCore.Qt.AlignCenter)
+            
+            self.region_checkboxes[idx] = (cb_affected, cb_negated, parameter_obj)
+            row += 1
 
     def _controller(self):
         doc = getattr(self.obj, "Document", None)
@@ -327,14 +349,18 @@ class TPMSGradingTaskPanel:
             obj.OffsetValue = float(self.offset_value.value())
             obj.ThicknessTransition = float(self.thickness_transition.value())
 
-            # Save AffectedRegions link list
+            # Save AffectedRegions and NegateRegions link lists
             selected_regions = []
+            negate_regions = []
             all_checked = True
             all_unchecked = True
-            for cb, param_obj in self.region_checkboxes.values():
-                if cb.isChecked():
+            
+            for cb_affected, cb_negated, param_obj in self.region_checkboxes.values():
+                if cb_affected.isChecked():
                     selected_regions.append(param_obj)
                     all_unchecked = False
+                    if cb_negated.isChecked():
+                        negate_regions.append(param_obj)
                 else:
                     all_checked = False
 
@@ -343,6 +369,8 @@ class TPMSGradingTaskPanel:
                 obj.AffectedRegions = []
             else:
                 obj.AffectedRegions = selected_regions
+                
+            obj.NegateRegions = negate_regions
 
             obj.touch()
             doc.recompute()

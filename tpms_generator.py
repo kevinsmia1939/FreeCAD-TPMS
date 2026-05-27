@@ -549,6 +549,7 @@ def _apply_offset_controls_to_field(
     sampling=0.0,
     grading_resolution=16,
     harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
+    region_index=None,
 ):
     offset = np.asarray(offset, dtype=float)
     if str(density_offset_mode) != "Non-uniform" or not density_offset_controls:
@@ -571,6 +572,7 @@ def _apply_offset_controls_to_field(
             minimum=None,
             grading_resolution=grading_resolution,
             harmonic_boundary_condition=harmonic_boundary_condition,
+            region_index=region_index,
         )
 
     result = np.array(offset, dtype=float, copy=True)
@@ -593,7 +595,16 @@ def _apply_offset_controls_to_field(
                 )
             transition = max(1e-9, float(control.get("transition", 1.0)))
             weight = _smooth_falloff_weight(distance, transition)
-            result = result + weight * (target - result)
+
+            negated_regions = control.get("negated_regions", [])
+            if negated_regions and region_index is not None:
+                voxel_target = np.full(wx.shape, target, dtype=float)
+                for r_idx in negated_regions:
+                    voxel_target[region_index == r_idx] = -target
+            else:
+                voxel_target = target
+
+            result = result + weight * (voxel_target - result)
         except Exception as exc:
             App.Console.PrintWarning("Ignoring TPMS hybrid thickness grading control: {}\n".format(exc))
     return result
@@ -793,6 +804,19 @@ def _blend_equation_field(base_field, x, y, z, wx, wy, wz, equation_blend_contro
     return field
 
 
+def _downsample_label_grid(grid, target_shape):
+    if grid is None:
+        return None
+    sh = grid.shape
+    t_sh = target_shape
+    if sh == t_sh:
+        return grid
+    z_idx = np.clip((np.arange(t_sh[0]) * sh[0] / t_sh[0]).astype(int), 0, sh[0] - 1)
+    y_idx = np.clip((np.arange(t_sh[1]) * sh[1] / t_sh[1]).astype(int), 0, sh[1] - 1)
+    x_idx = np.clip((np.arange(t_sh[2]) * sh[2] / t_sh[2]).astype(int), 0, sh[2] - 1)
+    return grid[np.ix_(z_idx, y_idx, x_idx)]
+
+
 def _harmonic_interpolated_field(
     wx,
     wy,
@@ -806,6 +830,7 @@ def _harmonic_interpolated_field(
     minimum=0.0,
     grading_resolution=16,
     harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
+    region_index=None,
 ):
     axes = _rectilinear_axes(wx, wy, wz)
     coarse_axes = _coarse_axes_for_harmonic(axes, grading_resolution) if axes is not None else None
@@ -824,6 +849,7 @@ def _harmonic_interpolated_field(
             minimum=minimum,
             grading_resolution=0,
             harmonic_boundary_condition=harmonic_boundary_condition,
+            region_index=_downsample_label_grid(region_index, cwx.shape),
         )
         interpolated = _interpolate_rectilinear_field(coarse_axes, coarse, axes)
         if interpolated is not None:
@@ -874,7 +900,15 @@ def _harmonic_interpolated_field(
             closest = inside & (distance <= max(float(np.min(distance[inside])) + 1e-12, band))
             mask = closest
         selected_fixed |= mask
-        selected_values[mask] += target
+        
+        negated_regions = control.get("negated_regions", [])
+        if negated_regions and region_index is not None:
+            voxel_target = np.full(wx.shape, target, dtype=float)
+            for r_idx in negated_regions:
+                voxel_target[region_index == r_idx] = -target
+            selected_values[mask] += voxel_target[mask]
+        else:
+            selected_values[mask] += target
         selected_counts[mask] += 1.0
 
     if np.any(selected_fixed):
@@ -2466,6 +2500,7 @@ def generate_hybrid_polydata(
         sampling,
         grading_resolution,
         harmonic_boundary_condition,
+        region_index=region_index,
     )
     material_field = np.full(field.shape, -1.0, dtype=float)
     for spec in region_specs:

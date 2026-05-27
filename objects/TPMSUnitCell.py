@@ -1655,6 +1655,8 @@ class TPMSGradingControl:
         if not hasattr(obj, "ThicknessTransition"):
             obj.addProperty("App::PropertyFloat", "ThicknessTransition", "Sheet/skeletal thickness", "Transition distance away from the selected face")
             obj.ThicknessTransition = 5.0
+        if not hasattr(obj, "NegateRegions"):
+            obj.addProperty("App::PropertyLinkList", "NegateRegions", "Sheet/skeletal thickness", "List of regions where the thickness grading value is negated")
 
     def onDocumentRestored(self, obj):
         self._add_properties(obj)
@@ -1673,6 +1675,7 @@ class TPMSGradingControl:
             "ThicknessSource",
             "OffsetValue",
             "ThicknessTransition",
+            "NegateRegions",
         ):
             _touch_linked_tpms_controllers(obj)
 
@@ -1992,6 +1995,12 @@ def _density_offset_controls(obj):
                     )
                 )
                 continue
+            negate_list = list(getattr(candidate, "NegateRegions", []))
+            negated_indices = []
+            for r_idx, r_setting in region_specs:
+                if r_setting in negate_list:
+                    negated_indices.append(r_idx)
+
             controls.append(
                 {
                     "type": "face_distance" if surface is not None else "face_plane",
@@ -2000,6 +2009,7 @@ def _density_offset_controls(obj):
                     "offset": float(getattr(candidate, "OffsetValue", 0.3)),
                     "transition": max(1e-9, float(getattr(candidate, "ThicknessTransition", 5.0))),
                     "surface": surface,
+                    "negated_regions": negated_indices,
                 }
             )
     return controls
