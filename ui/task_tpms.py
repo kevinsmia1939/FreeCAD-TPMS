@@ -286,11 +286,6 @@ class TPMSTaskPanel:
 
         self.surface.currentTextChanged.connect(self._surface_changed)
         self.coordinate_mode.currentTextChanged.connect(self._update_coordinate_controls)
-        self.density_mode.currentTextChanged.connect(self._update_density_controls)
-        self.density_gradient.currentTextChanged.connect(self._update_density_controls)
-        self.offset_density_mode.currentTextChanged.connect(self._update_density_controls)
-        self.offset_density_gradient.currentTextChanged.connect(self._update_density_controls)
-        self.add_grading_controls.clicked.connect(self._add_selected_grading_controls)
         self.boundary_select.clicked.connect(self._use_selected_boundary)
         self.boundary_evaluation.currentTextChanged.connect(self._update_boundary_controls)
         self.region_mode.currentTextChanged.connect(self._update_region_controls)
@@ -407,22 +402,13 @@ class TPMSTaskPanel:
         )
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
-        self._set_tip(self.density_mode, "Enable non-uniform unit-cell density grading from selected faces.")
-        self._set_tip(self.density_gradient, "Method used to interpolate unit-cell density from selected face controls.")
         self._set_tip(self.base_density, "Base unit-cell density multiplier away from selected grading faces.")
         self._set_tip(self.density_count_mode, "Controls whether density grading changes local cell count or preserves total count.")
-        self._set_tip(self.face_density, "Target unit-cell density multiplier for newly added selected-face grading controls.")
-        self._set_tip(self.density_transition, "Transition distance for newly added unit-cell density controls.")
         self._set_tip(self.grading_resolution, "Harmonic grading solve resolution. Lower values are faster; zero uses TPMS resolution.")
         self._set_tip(
             self.harmonic_boundary_condition,
             "Conductor fixes unselected boundary faces to the base value. Insulator leaves them free, like a no-flux electric boundary.",
         )
-        self._set_tip(self.offset_density_mode, "Enable non-uniform sheet or skeletal thickness grading from selected faces.")
-        self._set_tip(self.offset_density_gradient, "Method used to interpolate thickness from selected face controls.")
-        self._set_tip(self.offset_density_value, "Target thickness for newly added selected-face thickness controls. Zero and negative values are allowed.")
-        self._set_tip(self.offset_density_transition, "Transition distance for newly added thickness controls.")
-        self._set_tip(self.add_grading_controls, "Create TPMS Grading objects from the currently selected solid faces.")
         self._set_tip(self.origin_mode, "Controls where the TPMS coordinate system starts.")
         self._set_tip(self.origin_select, "Use the currently selected datum point or object placement as the TPMS origin.")
         for widget in (self.origin_x, self.origin_y, self.origin_z):
