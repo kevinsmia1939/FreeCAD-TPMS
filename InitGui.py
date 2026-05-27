@@ -17,6 +17,7 @@ class TPMSGeneratorWorkbench(Workbench):
         import commands.CmdGenerateTPMS
         import commands.CmdAddTPMSRegion
         import commands.CmdAddAllTPMSRegions
+        import commands.CmdAddTPMSGrading
         import commands.CmdAddTPMSTransitionFace
         import commands.CmdAddTPMSTransitionEdge
         import commands.CmdRefreshTPMS
@@ -25,6 +26,7 @@ class TPMSGeneratorWorkbench(Workbench):
             "TPMSGenerator_GenerateUnitCell",
             "TPMSGenerator_AddRegionSettings",
             "TPMSGenerator_AddAllRegionSettings",
+            "TPMSGenerator_AddGrading",
             "TPMSGenerator_AddTransitionFace",
             "TPMSGenerator_AddTransitionEdge",
             "TPMSGenerator_Refresh",

@@ -166,20 +166,6 @@ class TPMSTaskPanel:
 
         density_group = self._group(layout, "Grading")
 
-        self.density_mode = QtWidgets.QComboBox()
-        self.density_mode.addItems(["Uniform", "Non-uniform"])
-        self.density_mode.setCurrentText(str(getattr(obj, "DensityMode", "Uniform")))
-        density_group.addRow("Unit cell density", self.density_mode)
-
-        self.density_gradient = QtWidgets.QComboBox()
-        gradient_sources = [tpms_generator.GRADIENT_FACE_DISTANCE, tpms_generator.GRADIENT_FACE_PLANE, tpms_generator.GRADIENT_HARMONIC]
-        self.density_gradient.addItems(gradient_sources)
-        density_gradient = str(getattr(obj, "DensityGradient", tpms_generator.GRADIENT_FACE_DISTANCE))
-        if density_gradient not in gradient_sources:
-            density_gradient = tpms_generator.GRADIENT_FACE_DISTANCE
-        self.density_gradient.setCurrentText(density_gradient)
-        density_group.addRow("Gradient source", self.density_gradient)
-
         self.base_density = self._double_spin(float(getattr(obj, "BaseDensity", 1.0)), 0.05, 1000.0, 0.05)
         density_group.addRow("Base unit-cell density", self.base_density)
 
@@ -192,12 +178,6 @@ class TPMSTaskPanel:
             str(getattr(obj, "DensityCountMode", tpms_generator.DENSITY_COUNT_FOLLOW))
         )
         density_group.addRow("Unit-cell count", self.density_count_mode)
-
-        self.face_density = self._double_spin(float(getattr(obj, "FaceDensity", 1.5)), 0.05, 1000.0, 0.05)
-        density_group.addRow("Target unit-cell density", self.face_density)
-
-        self.density_transition = self._double_spin(float(getattr(obj, "DensityTransition", 5.0)), 0.001, 100000.0, 0.1)
-        density_group.addRow("Transition", self.density_transition)
 
         self.grading_resolution = self._spin(max(0, int(getattr(obj, "GradingResolution", 16))), 0, 512)
         self.grading_resolution.setSpecialValueText("Use TPMS resolution")
@@ -217,33 +197,7 @@ class TPMSTaskPanel:
         ):
             harmonic_boundary_condition = tpms_generator.HARMONIC_BOUNDARY_INSULATOR
         self.harmonic_boundary_condition.setCurrentText(harmonic_boundary_condition)
-        density_group.addRow("Unselected faces", self.harmonic_boundary_condition)
-
-        self.offset_density_mode = QtWidgets.QComboBox()
-        self.offset_density_mode.addItems(["Uniform", "Non-uniform"])
-        self.offset_density_mode.setCurrentText(str(getattr(obj, "DensityOffsetMode", "Uniform")))
-        density_group.addRow("Thickness grading", self.offset_density_mode)
-
-        self.offset_density_gradient = QtWidgets.QComboBox()
-        self.offset_density_gradient.addItems(gradient_sources)
-        offset_density_gradient = str(getattr(obj, "DensityOffsetGradient", tpms_generator.GRADIENT_FACE_DISTANCE))
-        if offset_density_gradient not in gradient_sources:
-            offset_density_gradient = tpms_generator.GRADIENT_FACE_DISTANCE
-        self.offset_density_gradient.setCurrentText(offset_density_gradient)
-        density_group.addRow("Thickness source", self.offset_density_gradient)
-
-        self.offset_density_value = self._double_spin(float(getattr(obj, "DensityOffsetValue", obj.Offset)), -1000.0, 1000.0, 0.05)
-        density_group.addRow("Target thickness", self.offset_density_value)
-
-        self.offset_density_transition = self._double_spin(float(getattr(obj, "DensityOffsetTransition", 5.0)), 0.001, 100000.0, 0.1)
-        density_group.addRow("Thickness transition", self.offset_density_transition)
-
-        self.grading_controls_label = QtWidgets.QLabel(self._grading_controls_text())
-        self.add_grading_controls = QtWidgets.QPushButton("Add selected faces")
-        grading_controls_layout = QtWidgets.QHBoxLayout()
-        grading_controls_layout.addWidget(self.grading_controls_label, 1)
-        grading_controls_layout.addWidget(self.add_grading_controls)
-        density_group.addRow("Face controls", grading_controls_layout)
+        density_group.addRow("Harmonic unselected faces", self.harmonic_boundary_condition)
 
         origin_group = self._group(layout, "Origin")
 
@@ -531,26 +485,7 @@ class TPMSTaskPanel:
             return "None"
         return getattr(boundary, "Label", getattr(boundary, "Name", "Selected object"))
 
-    def _face_controls_text(self):
-        count = len([control for control in getattr(self.obj, "FaceControls", []) if control is not None])
-        if count == 1:
-            return "1 control"
-        return "{} controls".format(count)
 
-    def _offset_controls_text(self):
-        count = len([control for control in getattr(self.obj, "DensityOffsetControls", []) if control is not None])
-        if count == 1:
-            return "1 control"
-        return "{} controls".format(count)
-
-    def _grading_controls_text(self):
-        controls = []
-        for control in list(getattr(self.obj, "FaceControls", [])) + list(getattr(self.obj, "DensityOffsetControls", [])):
-            if control is not None and control not in controls:
-                controls.append(control)
-        if len(controls) == 1:
-            return "1 control"
-        return "{} controls".format(len(controls))
 
     def _current_boundary_object(self):
         if hasattr(self, "_pending_boundary_object"):
@@ -766,20 +701,10 @@ class TPMSTaskPanel:
             self.phase_x,
             self.phase_y,
             self.phase_z,
-            self.density_mode,
-            self.density_gradient,
             self.base_density,
             self.density_count_mode,
-            self.face_density,
-            self.density_transition,
-            self.offset_density_mode,
-            self.offset_density_gradient,
-            self.offset_density_value,
-            self.offset_density_transition,
             self.grading_resolution,
             self.harmonic_boundary_condition,
-            self.grading_controls_label,
-            self.add_grading_controls,
         ):
             self._set_enabled(widget, not transition_role)
         self._update_surface_controls()
@@ -807,38 +732,26 @@ class TPMSTaskPanel:
         structure_enabled = self._structure_surface_active() and not self._transition_role_active()
         base_region = self.region_role.currentText() == "Base"
         grading_owner = structure_enabled and base_region
-        enabled = grading_owner and self.density_mode.currentText() == "Non-uniform"
-        face_enabled = enabled and self.density_gradient.currentText() in (
-            self.generator.GRADIENT_FACE_DISTANCE,
-            self.generator.GRADIENT_FACE_PLANE,
-            self.generator.GRADIENT_HARMONIC,
-        )
-        self._set_enabled(self.density_mode, grading_owner)
-        self._set_enabled(self.density_gradient, enabled)
-        self._set_enabled(self.density_count_mode, enabled)
+
         self._set_enabled(self.base_density, structure_enabled)
-        self._set_enabled(self.face_density, face_enabled)
-        self._set_enabled(self.density_transition, face_enabled and self.density_gradient.currentText() != self.generator.GRADIENT_HARMONIC)
-        offset_enabled = grading_owner and self.offset_density_mode.currentText() == "Non-uniform"
-        offset_face_enabled = offset_enabled and self.offset_density_gradient.currentText() in (
-            self.generator.GRADIENT_FACE_DISTANCE,
-            self.generator.GRADIENT_FACE_PLANE,
-            self.generator.GRADIENT_HARMONIC,
-        )
-        self._set_enabled(self.offset_density_mode, grading_owner)
-        self._set_enabled(self.offset_density_gradient, offset_enabled)
-        self._set_enabled(self.offset_density_value, offset_enabled)
-        self._set_enabled(self.offset_density_transition, offset_face_enabled and self.offset_density_gradient.currentText() != self.generator.GRADIENT_HARMONIC)
-        harmonic_enabled = (
-            (enabled and self.density_gradient.currentText() == self.generator.GRADIENT_HARMONIC)
-            or (offset_enabled and self.offset_density_gradient.currentText() == self.generator.GRADIENT_HARMONIC)
-        )
-        self._set_enabled(self.grading_resolution, harmonic_enabled)
-        self._set_enabled(self.harmonic_boundary_condition, harmonic_enabled)
-        controls_enabled = face_enabled or offset_face_enabled
-        self._set_enabled(self.grading_controls_label, controls_enabled)
-        self._set_enabled(self.add_grading_controls, controls_enabled)
-        self.grading_controls_label.setText(self._grading_controls_text())
+        self._set_enabled(self.density_count_mode, grading_owner)
+
+        # Dynamically check if any enabled grading control uses Harmonic
+        harmonic_enabled = False
+        doc = self.obj.Document
+        if doc is not None:
+            for candidate in doc.Objects:
+                if hasattr(candidate, "Proxy") and candidate.Proxy.__class__.__name__ == "TPMSGradingControl":
+                    if bool(getattr(candidate, "Enabled", True)):
+                        if (
+                            (bool(getattr(candidate, "UseUnitCellDensity", False)) and str(getattr(candidate, "DensitySource", "")) == self.generator.GRADIENT_HARMONIC)
+                            or (bool(getattr(candidate, "UseThickness", False)) and str(getattr(candidate, "ThicknessSource", "")) == self.generator.GRADIENT_HARMONIC)
+                        ):
+                            harmonic_enabled = True
+                            break
+
+        self._set_enabled(self.grading_resolution, grading_owner and harmonic_enabled)
+        self._set_enabled(self.harmonic_boundary_condition, grading_owner and harmonic_enabled)
 
     def _update_origin_controls(self):
         custom_enabled = self.origin_mode.currentText() == "Custom XYZ"
@@ -934,94 +847,13 @@ class TPMSTaskPanel:
         self.region_status.setText(self._region_status_text())
         self.result.setText(self._result_text())
 
-    def _add_selected_grading_controls(self):
-        from PySide import QtWidgets
-
-        try:
-            import FreeCADGui as Gui
-            from objects.TPMSUnitCell import add_grading_control
-            from objects.TPMSUnitCell import _base_controller_for
-        except Exception:
-            return
-        controller = _base_controller_for(self.obj)
-        if controller is not self.obj:
-            QtWidgets.QMessageBox.warning(
-                self.form,
-                "TPMS Parameters",
-                "Add grading controls from the Base Region Parameters object.",
-            )
-            return
-
-        use_unit_cell_density = self.density_mode.currentText() == "Non-uniform"
-        use_thickness = self.offset_density_mode.currentText() == "Non-uniform"
-        if not use_unit_cell_density and not use_thickness:
-            QtWidgets.QMessageBox.warning(
-                self.form,
-                "TPMS Parameters",
-                "Enable unit cell density or thickness grading first.",
-            )
-            return
-
-        created = 0
-        doc = self.obj.Document
-        doc.openTransaction("Add TPMS grading controls")
-        try:
-            self._apply_grading_settings()
-            for selection in Gui.Selection.getSelectionEx():
-                source = getattr(selection, "Object", None)
-                if source is None or not hasattr(source, "Shape"):
-                    continue
-                face_names = [
-                    str(name)
-                    for name in getattr(selection, "SubElementNames", [])
-                    if str(name).startswith("Face")
-                ]
-                if not face_names:
-                    continue
-                add_grading_control(
-                    controller,
-                    source,
-                    face_names,
-                    self.face_density.value(),
-                    self.density_transition.value(),
-                    self.offset_density_value.value(),
-                    self.offset_density_transition.value(),
-                    use_unit_cell_density,
-                    use_thickness,
-                )
-                created += 1
-            if not created:
-                raise ValueError("Select one or more solid faces first.")
-        except Exception as exc:
-            doc.abortTransaction()
-            QtWidgets.QMessageBox.warning(self.form, "TPMS Parameters", str(exc))
-            return
-        else:
-            doc.commitTransaction()
-
-        doc.recompute()
-        self.grading_controls_label.setText(self._grading_controls_text())
-        self._update_density_controls()
-        self.result.setText(self._result_text())
-
     def _apply_grading_settings(self):
         obj = self.obj
-        if self.region_role.currentText() != "Base":
-            obj.BaseDensity = float(self.base_density.value())
-            obj.touch()
-            return
-        obj.DensityMode = self.density_mode.currentText()
-        obj.DensityGradient = self.density_gradient.currentText()
         obj.BaseDensity = float(self.base_density.value())
-        obj.DensityCountMode = self.density_count_mode.currentText()
-        obj.FaceDensity = float(self.face_density.value())
-        obj.DensityTransition = float(self.density_transition.value())
-        obj.DensityOffsetMode = self.offset_density_mode.currentText()
-        obj.DensityOffsetGradient = self.offset_density_gradient.currentText()
-        obj.DensityOffsetValue = float(self.offset_density_value.value())
-        obj.DensityOffsetTransition = float(self.offset_density_transition.value())
-        obj.GradingResolution = int(self.grading_resolution.value())
-        obj.HarmonicBoundaryCondition = self.harmonic_boundary_condition.currentText()
+        if self.region_role.currentText() == "Base":
+            obj.DensityCountMode = self.density_count_mode.currentText()
+            obj.GradingResolution = int(self.grading_resolution.value())
+            obj.HarmonicBoundaryCondition = self.harmonic_boundary_condition.currentText()
         obj.touch()
 
     def _use_selected_origin(self):
