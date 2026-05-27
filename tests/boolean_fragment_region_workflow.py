@@ -21,6 +21,7 @@ from objects.TPMSUnitCell import (
     REGION_ROLE_TRANSITION,
     REGION_MODE_ALL,
     add_grading_control,
+    add_tpms_region_settings,
     add_tpms_region_settings_for_all_regions,
     boundary_region_items,
     is_tpms_unit_cell,
@@ -398,6 +399,7 @@ def _hybrid_transition_polydata(
     source_labyrinth=None,
     target_labyrinth=None,
     topology=None,
+    correction_factor=0.0,
 ):
     import Part
 
@@ -470,6 +472,7 @@ def _hybrid_transition_polydata(
                 "target_offset": 0.65,
                 "target_base_density": 1.2,
                 "blend": blend_mode or tpms_generator.TRANSITION_BLEND_THRESHOLD,
+                "correction_factor": correction_factor,
                 "source_labyrinth": source_labyrinth or tpms_generator.LABYRINTH_AUTO,
                 "target_labyrinth": target_labyrinth or tpms_generator.LABYRINTH_AUTO,
                 "topology": topology or tpms_generator.TRANSITION_TOPOLOGY_SAME_SIDE,
@@ -529,7 +532,7 @@ def run_transition_region_surface_modes_case():
         tpms_generator.PART_UPPER,
         "Gyroid",
         tpms_generator.PART_SHEET,
-        tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
+        tpms_generator.TRANSITION_BLEND_SIGMOID,
     )
     upper_sheet_mesh = _assert_valid_polydata("Upper-skeletal to sheet transition", upper_to_sheet)
 
@@ -589,16 +592,6 @@ def run_labyrinth_transition_modes_case():
         target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
         topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
     )
-    signed_blend = _hybrid_transition_polydata(
-        "Gyroid",
-        tpms_generator.PART_UPPER,
-        "Gyroid",
-        tpms_generator.PART_LOWER,
-        blend_mode=tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
-        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
-        target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
-        topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
-    )
     sigmoid_blend = _hybrid_transition_polydata(
         "Gyroid",
         tpms_generator.PART_UPPER,
@@ -609,22 +602,33 @@ def run_labyrinth_transition_modes_case():
         target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
         topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
     )
+    asli_blend = _hybrid_transition_polydata(
+        "Gyroid",
+        tpms_generator.PART_UPPER,
+        "Gyroid",
+        tpms_generator.PART_LOWER,
+        blend_mode=tpms_generator.TRANSITION_BLEND_NORMALIZED_SUM,
+        correction_factor=0.5,
+        source_labyrinth=tpms_generator.LABYRINTH_POSITIVE,
+        target_labyrinth=tpms_generator.LABYRINTH_NEGATIVE,
+        topology=tpms_generator.TRANSITION_TOPOLOGY_CROSS_BRIDGE,
+    )
     offset_signature = signature(_assert_valid_polydata("Cross-labyrinth offset-surface blend", offset_blend))
-    signed_signature = signature(_assert_valid_polydata("Cross-labyrinth signed-field blend", signed_blend))
     sigmoid_signature = signature(_assert_valid_polydata("Cross-labyrinth sigmoid blend", sigmoid_blend))
-    if offset_signature == signed_signature:
+    asli_signature = signature(_assert_valid_polydata("Cross-labyrinth ASLI blend", asli_blend))
+    if offset_signature == sigmoid_signature:
         raise RuntimeError("Transition blend modes produced identical signatures")
-    if sigmoid_signature in (offset_signature, signed_signature):
-        raise RuntimeError("Sigmoid transition blend matched an existing blend signature")
+    if asli_signature in (offset_signature, sigmoid_signature):
+        raise RuntimeError("ASLI transition blend matched an existing blend signature")
     print(
-        "PASS labyrinth_transition_modes same_facets={} same_hash={} cross_facets={} cross_hash={} offset_hash={} signed_hash={} sigmoid_hash={}".format(
+        "PASS labyrinth_transition_modes same_facets={} same_hash={} cross_facets={} cross_hash={} offset_hash={} sigmoid_hash={} asli_hash={}".format(
             same_signature[0],
             same_signature[1],
             cross_signature[0],
             cross_signature[1],
             offset_signature[1],
-            signed_signature[1],
             sigmoid_signature[1],
+            asli_signature[1],
         )
     )
 
@@ -1288,9 +1292,61 @@ def run_harmonic_density_count_mode_case():
         App.closeDocument(doc.Name)
 
 
+def run_region_origin_case():
+    import hashlib
+    doc = App.newDocument("RegionOriginTest")
+    try:
+        box1 = doc.addObject("Part::Box", "Box1")
+        box1.Length = 10
+        box1.Width = 10
+        box1.Height = 10
+        box2 = doc.addObject("Part::Box", "Box2")
+        box2.Length = 10
+        box2.Width = 10
+        box2.Height = 10
+        box2.Placement.Base = App.Vector(10, 0, 0)
+        compound = doc.addObject("Part::Compound", "Compound")
+        compound.Links = [box1, box2]
+        doc.recompute()
+        _, controller, _ = make_tpms_unit_cell(doc)
+        controller.BoundaryObject = compound
+        controller.BoundaryMode = "Selected solid"
+        controller.Equation = "cos(x) + cos(y) + cos(z)"
+        controller.Resolution = 8
+        controller.Offset = 0.5
+        controller.RegionMode = "All regions"
+        region2, _ = add_tpms_region_settings(controller)
+        region2.RegionMode = "Single region"
+        region2.RegionIndex = 1
+        region2.RegionRole = "Override"
+        region2.OriginMode = "Custom XYZ"
+        region2.Origin = App.Vector(0.0, 0.0, 0.0)
+        doc.recompute()
+
+        mesh1 = controller.ResultMesh.Mesh.copy()
+        region2.Origin = App.Vector(2.0, 0.0, 0.0)
+        doc.recompute()
+        mesh2 = controller.ResultMesh.Mesh.copy()
+
+        def signature(mesh):
+            sample = [(round(p.x, 5), round(p.y, 5), round(p.z, 5)) for p in mesh.Points]
+            return int(mesh.CountFacets), hashlib.sha256(repr(sample).encode("utf-8")).hexdigest()[:16]
+
+        sig1 = signature(mesh1)
+        sig2 = signature(mesh2)
+        print("DEBUG sig1: facets={} hash={}".format(sig1[0], sig1[1]))
+        print("DEBUG sig2: facets={} hash={}".format(sig2[0], sig2[1]))
+        if sig1 == sig2:
+            raise RuntimeError("Region origin change did not affect the mesh signature")
+        print("PASS region_origin_movement hash1={} hash2={}".format(sig1[1], sig2[1]))
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def main():
     for name in TEST_FILES:
         run_file(os.path.join(STUDY_DIR, name))
+    run_region_origin_case()
     run_generated_transition_region_case()
     run_region_grading_separation_case()
     run_transition_region_surface_modes_case()

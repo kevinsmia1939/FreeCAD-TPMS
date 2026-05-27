@@ -61,7 +61,7 @@ regions.
 
 ### Transition Blend Modes
 
-Transition regions support three blend modes:
+Transition regions support two blend modes:
 
 - `Offset Surface Interpolation`: blends the valid TPMS material interval for
   each part type.  For example, a sheet is treated as the interval around the
@@ -69,18 +69,66 @@ Transition regions support three blend modes:
   one-sided intervals.  This is the safer choice for transitions between sheet
   and skeletal TPMS because it avoids field cancellation that can create torn or
   abrupt-looking meshes.
-- `Morphological signed-field blend`: blends the signed implicit material
-  fields directly.  This matches the common form `F_hybrid = w * F_target +
-  (1 - w) * F_source`.  It is useful for compatible solid fields, empty/solid
-  transitions, or similar structures.  For sheet-to-skeletal transitions,
-  direct signed-field blending can cancel near the midpoint of the transition,
-  which may create torn or abrupt-looking meshes.  In that case, choose
-  `Offset Surface Interpolation` explicitly.
-- `Sigmoid blend`: blends the same signed implicit material fields as
-  `Morphological signed-field blend`, but remaps the transition weight through
+- `Sigmoid blend`: blends the signed implicit material fields, but remaps the transition weight through
   a normalized sigmoid curve.  This keeps more of each endpoint structure near
   the transition boundaries and makes the blend change faster near the middle
   of the transition region.
+
+## TPMS Transition Face & Edge
+
+For finer, boundary-specific control in partitioned multi-region models, the workbench supports blending directly along shared faces or shared edges of adjoining solid regions.
+
+### TPMS Transition Face
+
+A face-based transition blends two adjacent TPMS structures across a shared boundary face.
+
+#### Mathematical Formulation
+
+1. **Blend Weight**: The transition weight $t(x)$ is computed from the signed distance $d(x)$ to the shared face and the configured blend width $W$:
+   $$t(x) = \text{clip}\left(\frac{1}{2} \left(1 + \frac{2d(x)}{W}\right), 0.0, 1.0\right)$$
+   If `Sigmoid` blend mode is selected, $t(x)$ is mapped through a normalized sigmoid curve:
+   $$\sigma(t) = \frac{1}{1 + e^{-k(t - 0.5)}}$$
+
+2. **Phase 1 (TPMS & Offset Blend)**: The implicit functions $F$ and offsets $O$ are blended linearly:
+   $$F_{blended}(x) = (1 - t(x)) F_{source}(x) + t(x) F_{target}(x)$$
+   $$O_{blended}(x) = (1 - t(x)) O_{source} + t(x) O_{target}$$
+
+3. **Phase 2 (Interval Bound Blending)**: To ensure a continuous material boundary without mesh tearing (especially when morphing between sheet and skeletal structures), we blend the lower and upper bounds of the respective part intervals ($L_k, U_k$):
+   $$L_{blended}(x) = (1 - t(x)) L_{source}(x) + t(x) L_{target}(x)$$
+   $$U_{blended}(x) = (1 - t(x)) U_{source}(x) + t(x) U_{target}(x)$$
+   
+   The final material field $M_{blended}(x)$ is computed as:
+   $$M_{blended}(x) = \min\left(F_{blended}(x) - L_{blended}(x), U_{blended}(x) - F_{blended}(x)\right)$$
+
+---
+
+### TPMS Transition Edge
+
+An edge-based transition blends multiple ($N \ge 2$) adjacent TPMS structures meeting at a shared topological boundary edge.
+
+#### Mathematical Formulation
+
+1. **Blend Weight**: We compute a radial cylindrical blend weight $u(x) = \text{clip}(d_{edge}(x) / R, 0.0, 1.0)$ using the distance $d_{edge}(x)$ to the edge points and the blend radius $R$.
+   The edge weight is smoothstepped to zero at the cylinder boundary:
+   $$w_{edge}(x) = 1.0 - \text{smoothstep}(u(x))$$
+
+2. **Phase 1 (N-Way Fields & Hierarchical Background Blending)**:
+   We evaluate the continuous Euclidean regional weights $w_k(x)$ for each adjacent region $k$ and blend the implicit fields and offsets:
+   $$F_{blended}(x) = \sum_{k=1}^N w_k(x) F_k(x), \quad O_{blended}(x) = \sum_{k=1}^N w_k(x) O_k$$
+   
+   To achieve $C^1$ continuity at the cylinder boundary ($d_{edge} \approx R$), we hierarchically blend $F_{blended}$ and $O_{blended}$ with the pre-existing background fields $F_{bg}$ and $O_{bg}$ (which already contain face transitions):
+   $$F_{final}(x) = w_{edge}(x) F_{blended}(x) + (1.0 - w_{edge}(x)) F_{bg}(x)$$
+   $$O_{final}(x) = w_{edge}(x) O_{blended}(x) + (1.0 - w_{edge}(x)) O_{bg}(x)$$
+
+3. **Phase 2 (N-Way Interval Boundary Blending)**:
+   Directly averaging material fields causes out-of-phase field cancellation, producing thin strings and severe hollow voids along the edge. Instead, we perform **N-Way Interval Boundary Blending** by blending the lower and upper bounds of the part intervals ($L_k, U_k$):
+   $$L_{blended}(x) = \sum_{k=1}^N w_k(x) L_k(x), \quad U_{blended}(x) = \sum_{k=1}^N w_k(x) U_k(x)$$
+   
+   The pure edge material field is then constructed from the final Phase 1 field and these blended bounds:
+   $$M_{blended}(x) = \min\left(F_{final}(x) - L_{blended}(x), U_{blended}(x) - F_{final}(x)\right)$$
+   
+   This edge material field is hierarchically blended into the background material field $M_{bg}(x)$ to ensure a watertight, smooth, and seamless morph:
+   $$M_{final}(x) = w_{edge}(x) M_{blended}(x) + (1.0 - w_{edge}(x)) M_{bg}(x)$$
 
 ## Cylindrical Rings
 

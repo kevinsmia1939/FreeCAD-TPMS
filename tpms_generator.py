@@ -43,8 +43,8 @@ GRADIENT_HARMONIC = "Harmonic field"
 HARMONIC_BOUNDARY_CONDUCTOR = "Conductor"
 HARMONIC_BOUNDARY_INSULATOR = "Insulator"
 TRANSITION_BLEND_THRESHOLD = "Offset Surface Interpolation"
-TRANSITION_BLEND_SIGNED_FIELD = "Morphological signed-field blend"
 TRANSITION_BLEND_SIGMOID = "Sigmoid blend"
+TRANSITION_BLEND_NORMALIZED_SUM = "Normalized weighted sum (ASLI)"
 LABYRINTH_AUTO = "Auto"
 LABYRINTH_POSITIVE = "Upper labyrinth"
 LABYRINTH_NEGATIVE = "Lower labyrinth"
@@ -1493,6 +1493,22 @@ def _analytic_csg_boundary_field(boundary_object, wx, wy, wz, sampling=0.0, fall
                 result = np.minimum(result, field)
         return result
 
+    if type_id == "Part::Compound":
+        wx, wy, wz = _csg_operand_coordinates(boundary_object, wx, wy, wz)
+        shapes = list(getattr(boundary_object, "Links", []) or [])
+        if not shapes:
+            return None
+        fields = []
+        for shape_object in shapes:
+            field = _analytic_or_leaf_boundary_field(shape_object, wx, wy, wz, sampling, fallback_resolution)
+            if field is None:
+                return None
+            fields.append(field)
+        result = fields[0]
+        for field in fields[1:]:
+            result = np.maximum(result, field)
+        return result
+
     return None
 
 
@@ -1949,11 +1965,15 @@ def generate_hybrid_polydata(
     harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
     coordinate_mode=COORDINATE_CARTESIAN,
     ring_angular_cells=8,
+    face_transition_specs=None,
+    edge_transition_specs=None,
 ):
     configure_vtk_smp()
     region_specs = list(region_specs or [])
     transition_controls = list(transition_controls or [])
     transition_region_specs = list(transition_region_specs or [])
+    face_transition_specs = list(face_transition_specs or [])
+    edge_transition_specs = list(edge_transition_specs or [])
     cylindrical_grid = None
     if str(coordinate_mode) == COORDINATE_CYLINDRICAL_RING:
         cylindrical_grid = _make_hybrid_cylindrical_ring_grid(
@@ -2051,12 +2071,47 @@ def generate_hybrid_polydata(
         surface_mode = str(spec.get(surface_key, spec.get("surface", "")))
         if surface_mode in (SURFACE_EMPTY, SURFACE_SOLID_FILL):
             return np.zeros(field.shape, dtype=float)
+
+        origin_key = equation_key.replace("equation", "origin")
+        rotation_key = equation_key.replace("equation", "origin_rotation")
+        
+        # We must apply the same base_density and phase shift as _density_phase_coordinates
+        # to ensure local origins stay in sync with the global grid.
+        global_phase = np.asarray(phase, dtype=float)
+        global_base_density = max(0.05, float(base_density))
+
+        # Check if this specific spec has a local origin/rotation override.
+        if spec.get(origin_key) is not None or spec.get(rotation_key) is not None:
+            local_origin = spec.get(origin_key)
+            if local_origin is None:
+                local_origin = _default_origin(BOUNDARY_SELECTED_SOLID, spec.get("boundary_object"))
+            local_origin = np.asarray(local_origin, dtype=float)
+            local_rotation = spec.get(rotation_key)
+            local_rotation_matrix = _rotation_matrix(local_rotation, spec.get("boundary_object"))
+
+            if local_rotation_matrix is not None:
+                lx, ly, lz = _world_to_origin_frame_arrays(local_rotation_matrix, wx, wy, wz, local_origin)
+            else:
+                lx = wx - local_origin[0]
+                ly = wy - local_origin[1]
+                lz = wz - local_origin[2]
+            
+            # Apply global phase and scaling
+            lx = global_base_density * (lx + global_phase[0])
+            ly = global_base_density * (ly + global_phase[1])
+            lz = global_base_density * (lz + global_phase[2])
+        else:
+            # Fall back to pre-calculated global phase coordinates
+            lx, ly, lz = x, y, z
+
         density = max(0.05, float(spec.get(density_key, base_density)))
-        scale = density / base_density
+        # scale here is (target_density / base_density). 
+        # Since lx is already scaled by base_density, lx * scale = target_density * (tx + phase)
+        scale = density / global_base_density
         equation_text = str(spec.get(equation_key, equation)).strip()
         if not equation_text:
             equation_text = equation
-        values = np.asarray(evaluate_equation(equation_text, x * scale, y * scale, z * scale), dtype=float)
+        values = np.asarray(evaluate_equation(equation_text, lx * scale, ly * scale, lz * scale), dtype=float)
         if values.shape == ():
             values = np.full(field.shape, float(values))
         return values
@@ -2168,7 +2223,10 @@ def generate_hybrid_polydata(
         boundary = spec.get("boundary_object")
         if boundary is None:
             continue
-        mask = boundary_mask(boundary)
+        # Use mask_boundary_object (fragmented solid) if available, to ensure non-overlapping
+        # voxel assignment even when the source objects overlap before fragmentation.
+        mask_boundary = spec.get("mask_boundary_object", boundary)
+        mask = boundary_mask(mask_boundary)
         if not np.any(mask):
             continue
         spec_field = evaluated_field(spec)
@@ -2179,6 +2237,7 @@ def generate_hybrid_polydata(
         if spec_material.shape == material_field.shape:
             material_field[mask] = spec_material[mask]
         region_index[mask] = int(spec.get("index", -1))
+
 
     for spec in transition_region_specs:
         boundary = spec.get("boundary_object")
@@ -2229,6 +2288,111 @@ def generate_hybrid_polydata(
         material_field[mask] = ((1.0 - t) * source_material + t * target_material)[mask]
         region_index[mask] = int(spec.get("index", -1))
 
+    for spec in list(face_transition_specs or []):
+        source_index = int(spec.get("source_index", -1))
+        target_index = int(spec.get("target_index", -1))
+        blend_width = float(spec.get("blend_width", 5.0))
+        if source_index == -1 or target_index == -1:
+            continue
+        transition_mask = (region_index == source_index) | (region_index == target_index)
+        if not np.any(transition_mask):
+            continue
+        try:
+            distance = np.abs(_face_distance_field(wx, wy, wz, spec))
+            blend_mask = transition_mask & (distance <= blend_width / 2.0)
+            if not np.any(blend_mask):
+                continue
+            source_field = evaluated_field(spec, "source_equation", "source_base_density")
+            target_field = evaluated_field(spec, "target_equation", "target_base_density")
+            if source_field.shape != field.shape or target_field.shape != field.shape:
+                continue
+            t = np.where(region_index == source_index, 0.5 * (1.0 - 2.0 * distance / blend_width), 0.5 * (1.0 + 2.0 * distance / blend_width))
+            t = np.clip(t, 0.0, 1.0)
+            blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+            t = transition_weight(t, blend_mode)
+            field[blend_mask] = ((1.0 - t) * source_field + t * target_field)[blend_mask]
+            source_offset = float(spec.get("source_offset", offset))
+            target_offset = float(spec.get("target_offset", offset))
+            offset_field[blend_mask] = ((1.0 - t) * source_offset + t * target_offset)[blend_mask]
+        except Exception as exc:
+            App.Console.PrintWarning("Failed to apply face transition: {}\n".format(exc))
+
+    for spec in list(edge_transition_specs or []):
+        blend_radius = float(spec.get("blend_radius", 5.0))
+        edge_points = spec.get("edge_points", [])
+        if not edge_points or blend_radius <= 0.0:
+            continue
+        adj_specs = spec.get("adjacent_regions", [])
+        if len(adj_specs) < 2:
+            continue
+        
+        adj_indices = [int(r["index"]) for r in adj_specs]
+        transition_mask = np.isin(region_index, adj_indices)
+        if not np.any(transition_mask):
+            continue
+            
+        try:
+            from scipy.spatial import cKDTree as KDTree
+            pts = np.column_stack((wx.ravel(), wy.ravel(), wz.ravel()))
+            tree = KDTree(edge_points)
+            dist_flat, _ = tree.query(pts, k=1)
+            distance = dist_flat.reshape(wx.shape)
+            
+            blend_mask = transition_mask & (distance <= blend_radius)
+            if not np.any(blend_mask):
+                continue
+                
+            N = len(adj_indices)
+            u = np.clip(distance / blend_radius, 0.0, 1.0)
+            blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+            u = transition_weight(u, blend_mode)
+            
+            # Calculate continuous distances to each region
+            v_keys = []
+            for r_spec in adj_specs:
+                r_boundary = r_spec.get("boundary_object")
+                if r_boundary is None:
+                    own_mask = (region_index == int(r_spec["index"]))
+                    w_k_fallback = np.where(own_mask, 1.0 / N + ((N - 1.0) / N) * u, (1.0 - u) / N)
+                    v_keys.append(w_k_fallback)
+                else:
+                    dist_k = boundary_distance(r_boundary)
+                    inside_k = boundary_mask(r_boundary)
+                    d_k = np.where(inside_k, 0.0, dist_k)
+                    
+                    t_k = np.clip(1.0 - d_k / blend_radius, 0.0, 1.0)
+                    v_k = transition_weight(t_k, blend_mode)
+                    v_keys.append(v_k)
+            
+            v_sum = sum(v_keys)
+            v_sum = np.where(v_sum > 1e-12, v_sum, 1.0)
+            
+            # Capture pre-existing background (includes face transitions)
+            bg_field = field.copy()
+            bg_offset = offset_field.copy()
+            
+            blended_field = np.zeros(field.shape, dtype=float)
+            blended_offset = np.zeros(field.shape, dtype=float)
+            
+            for idx, r_spec in enumerate(adj_specs):
+                w_k = v_keys[idx] / v_sum
+                r_field = evaluated_field(r_spec, "equation", "base_density")
+                r_offset = float(r_spec.get("offset", offset))
+                
+                blended_field += w_k * r_field
+                blended_offset += w_k * r_offset
+            
+            # Hierarchical blend: smoothly merge edge result with background
+            # w_edge=1 at edge center (d=0), w_edge=0 at cylinder boundary (d=R)
+            w_edge = 1.0 - u
+            final_field = w_edge * blended_field + (1.0 - w_edge) * bg_field
+            final_offset = w_edge * blended_offset + (1.0 - w_edge) * bg_offset
+                
+            field[blend_mask] = final_field[blend_mask]
+            offset_field[blend_mask] = final_offset[blend_mask]
+        except Exception as exc:
+            App.Console.PrintWarning("Failed to apply edge transition in Phase 1: {}\n".format(exc))
+
     for control in transition_controls:
         source_index = int(control.get("source_index", -999999))
         target_equation = str(control.get("target_equation", "")).strip()
@@ -2275,7 +2439,10 @@ def generate_hybrid_polydata(
         boundary = spec.get("boundary_object")
         if boundary is None:
             continue
-        mask = boundary_mask(boundary)
+        # Use mask_boundary_object (fragmented solid) if available, to ensure non-overlapping
+        # voxel assignment even when the source objects overlap before fragmentation.
+        mask_boundary = spec.get("mask_boundary_object", boundary)
+        mask = boundary_mask(mask_boundary)
         if not np.any(mask):
             continue
         spec_field = evaluated_field(spec)
@@ -2286,6 +2453,7 @@ def generate_hybrid_polydata(
             str(spec.get("surface", "")),
         )
         material_field[mask] = spec_material[mask]
+
     for spec in transition_region_specs:
         boundary = spec.get("boundary_object")
         source_boundary = spec.get("source_boundary_object")
@@ -2339,8 +2507,43 @@ def generate_hybrid_polydata(
             effective_target_part,
             str(spec.get("target_surface", "")),
         )
-        if blend_mode in (TRANSITION_BLEND_SIGNED_FIELD, TRANSITION_BLEND_SIGMOID):
+        if blend_mode == TRANSITION_BLEND_SIGMOID:
             blended_material = ((1.0 - t) * source_material + t * target_material)
+        elif blend_mode == TRANSITION_BLEND_NORMALIZED_SUM:
+            k = float(spec.get("correction_factor", 0.0))
+            w1 = 1.0 - t
+            w2 = t
+            # Avoid division by zero at endpoints, though np.divide handles it
+            norm = np.sqrt(w1**2 + w2**2)
+            W1 = np.divide(w1, norm, out=np.zeros_like(w1), where=norm > 1e-12)
+            W2 = np.divide(w2, norm, out=np.zeros_like(w2), where=norm > 1e-12)
+
+            # ASLI correction factor peaks at W=0.5
+            C1 = 1.0 + k * (1.0 - (2.0 * W1 - 1.0)**2)
+            C2 = 1.0 + k * (1.0 - (2.0 * W2 - 1.0)**2)
+
+            def adjust_offset_asli(off, part_name, corr):
+                # For skeletal, thinning is compensated by reducing the threshold (offset)
+                # For sheets, thinning is compensated by increasing the thickness (offset)
+                if _is_skeletal_part(part_name):
+                    return off / corr
+                return off * corr
+
+            # We use the interpolated offset_field as base, as it already handles
+            # grading between source and target offset values.
+            source_material_adj = material_from_field(
+                source_field,
+                adjust_offset_asli(offset_field, effective_source_part, C1),
+                effective_source_part,
+                str(spec.get("source_surface", "")),
+            )
+            target_material_adj = material_from_field(
+                target_field,
+                adjust_offset_asli(offset_field, effective_target_part, C2),
+                effective_target_part,
+                str(spec.get("target_surface", "")),
+            )
+            blended_material = W1 * source_material_adj + W2 * target_material_adj
         else:
             blended_material = transition_material_from_parts(
                 source_field,
@@ -2370,6 +2573,246 @@ def generate_hybrid_polydata(
         if bridge_material is not None:
             blended_material = np.maximum(blended_material, bridge_material)
         material_field[mask] = blended_material[mask]
+
+    for spec in list(face_transition_specs or []):
+        source_index = int(spec.get("source_index", -1))
+        target_index = int(spec.get("target_index", -1))
+        blend_width = float(spec.get("blend_width", 5.0))
+        if source_index == -1 or target_index == -1:
+            continue
+        transition_mask = (region_index == source_index) | (region_index == target_index)
+        if not np.any(transition_mask):
+            continue
+        try:
+            distance = np.abs(_face_distance_field(wx, wy, wz, spec))
+            blend_mask = transition_mask & (distance <= blend_width / 2.0)
+            if not np.any(blend_mask):
+                continue
+                
+            source_field = evaluated_field(spec, "source_equation", "source_base_density")
+            target_field = evaluated_field(spec, "target_equation", "target_base_density")
+            
+            t = np.where(region_index == source_index, 0.5 * (1.0 - 2.0 * distance / blend_width), 0.5 * (1.0 + 2.0 * distance / blend_width))
+            t = np.clip(t, 0.0, 1.0)
+            
+            blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+            t = transition_weight(t, blend_mode)
+            
+            source_part = str(spec.get("source_part", part))
+            target_part = str(spec.get("target_part", part))
+            source_labyrinth = str(spec.get("source_labyrinth", LABYRINTH_AUTO))
+            target_labyrinth = str(spec.get("target_labyrinth", LABYRINTH_AUTO))
+            topology_mode = str(spec.get("topology", TRANSITION_TOPOLOGY_SAME_SIDE))
+            effective_source_part = skeletal_part_for_labyrinth(source_part, source_labyrinth)
+            effective_target_part = skeletal_part_for_labyrinth(target_part, target_labyrinth)
+            
+            source_material = material_from_field(
+                source_field,
+                offset_field,
+                effective_source_part,
+                str(spec.get("source_surface", "")),
+            )
+            target_material = material_from_field(
+                target_field,
+                offset_field,
+                effective_target_part,
+                str(spec.get("target_surface", "")),
+            )
+            
+            if blend_mode == TRANSITION_BLEND_SIGMOID:
+                blended_material = ((1.0 - t) * source_material + t * target_material)
+            elif blend_mode == TRANSITION_BLEND_NORMALIZED_SUM:
+                k = float(spec.get("correction_factor", 0.0))
+                w1 = 1.0 - t
+                w2 = t
+                norm = np.sqrt(w1**2 + w2**2)
+                W1 = np.divide(w1, norm, out=np.zeros_like(w1), where=norm > 1e-12)
+                W2 = np.divide(w2, norm, out=np.zeros_like(w2), where=norm > 1e-12)
+                
+                C1 = 1.0 + k * (1.0 - (2.0 * W1 - 1.0)**2)
+                C2 = 1.0 + k * (1.0 - (2.0 * W2 - 1.0)**2)
+                
+                def adjust_offset_asli(off, part_name, corr):
+                    if _is_skeletal_part(part_name):
+                        return off / corr
+                    return off * corr
+                    
+                source_material_adj = material_from_field(
+                    source_field,
+                    adjust_offset_asli(offset_field, effective_source_part, C1),
+                    effective_source_part,
+                    str(spec.get("source_surface", "")),
+                )
+                target_material_adj = material_from_field(
+                    target_field,
+                    adjust_offset_asli(offset_field, effective_target_part, C2),
+                    effective_target_part,
+                    str(spec.get("target_surface", "")),
+                )
+                blended_material = W1 * source_material_adj + W2 * target_material_adj
+            else:
+                blended_material = transition_material_from_parts(
+                    source_field,
+                    target_field,
+                    offset_field,
+                    t,
+                    effective_source_part,
+                    effective_target_part,
+                    str(spec.get("source_surface", "")),
+                    str(spec.get("target_surface", "")),
+                )
+                if blended_material is None:
+                    blended_material = ((1.0 - t) * source_material + t * target_material)
+                    
+            bridge_material = cross_labyrinth_bridge_material(
+                source_field,
+                target_field,
+                offset_field,
+                t,
+                source_part,
+                target_part,
+                source_labyrinth,
+                target_labyrinth,
+                topology_mode,
+                str(spec.get("source_surface", "")),
+                str(spec.get("target_surface", "")),
+            )
+            if bridge_material is not None:
+                blended_material = np.maximum(blended_material, bridge_material)
+                
+            material_field[blend_mask] = blended_material[blend_mask]
+        except Exception as exc:
+            App.Console.PrintWarning("Failed to apply face transition material: {}\n".format(exc))
+
+    for spec in list(edge_transition_specs or []):
+        blend_radius = float(spec.get("blend_radius", 5.0))
+        edge_points = spec.get("edge_points", [])
+        if not edge_points or blend_radius <= 0.0:
+            continue
+        adj_specs = spec.get("adjacent_regions", [])
+        if len(adj_specs) < 2:
+            continue
+        
+        adj_indices = [int(r["index"]) for r in adj_specs]
+        transition_mask = np.isin(region_index, adj_indices)
+        if not np.any(transition_mask):
+            continue
+            
+        try:
+            from scipy.spatial import cKDTree as KDTree
+            pts = np.column_stack((wx.ravel(), wy.ravel(), wz.ravel()))
+            tree = KDTree(edge_points)
+            dist_flat, _ = tree.query(pts, k=1)
+            distance = dist_flat.reshape(wx.shape)
+            
+            blend_mask = transition_mask & (distance <= blend_radius)
+            if not np.any(blend_mask):
+                App.Console.PrintMessage("[EDGE-DBG] blend_mask is EMPTY, skipping\n")
+                continue
+            
+            App.Console.PrintMessage("[EDGE-DBG] Phase2: blend_mask has {} voxels (of {} total)\n".format(int(np.sum(blend_mask)), blend_mask.size))
+            App.Console.PrintMessage("[EDGE-DBG] adj_indices={}, transition_mask has {} voxels\n".format(adj_indices, int(np.sum(transition_mask))))
+            App.Console.PrintMessage("[EDGE-DBG] distance range in blend: {:.4f} to {:.4f}\n".format(float(np.min(distance[blend_mask])), float(np.max(distance[blend_mask]))))
+                
+            N = len(adj_indices)
+            u = np.clip(distance / blend_radius, 0.0, 1.0)
+            blend_mode = str(spec.get("blend", TRANSITION_BLEND_THRESHOLD))
+            u = transition_weight(u, blend_mode)
+            
+            # Calculate continuous distances to each region
+            v_keys = []
+            for r_spec in adj_specs:
+                r_boundary = r_spec.get("boundary_object")
+                if r_boundary is None:
+                    own_mask = (region_index == int(r_spec["index"]))
+                    w_k_fallback = np.where(own_mask, 1.0 / N + ((N - 1.0) / N) * u, (1.0 - u) / N)
+                    v_keys.append(w_k_fallback)
+                else:
+                    dist_k = boundary_distance(r_boundary)
+                    inside_k = boundary_mask(r_boundary)
+                    d_k = np.where(inside_k, 0.0, dist_k)
+                    
+                    t_k = np.clip(1.0 - d_k / blend_radius, 0.0, 1.0)
+                    v_k = transition_weight(t_k, blend_mode)
+                    v_keys.append(v_k)
+            
+            v_sum = sum(v_keys)
+            v_sum = np.where(v_sum > 1e-12, v_sum, 1.0)
+            
+            weights = []
+            for idx, r_spec in enumerate(adj_specs):
+                w_k = v_keys[idx] / v_sum
+                weights.append((r_spec, w_k))
+            
+            # Capture pre-existing background material (includes face transitions)
+            bg_material = material_field.copy()
+            
+            # Use N-way interval boundary blending for material blending to preserve 
+            # solid regions and avoid voids. We blend the lower and upper bounds of 
+            # each adjacent region, then construct the blended material field from 
+            # the already-blended field and these blended bounds.
+            blended_lower = np.zeros(material_field.shape, dtype=float)
+            blended_upper = np.zeros(material_field.shape, dtype=float)
+            for r_spec, w_k in weights:
+                r_field = evaluated_field(r_spec, "equation", "base_density")
+                r_part = str(r_spec.get("part", part))
+                r_surface = str(r_spec.get("surface", ""))
+                
+                limit = max(
+                    float(np.nanmax(np.abs(r_field))) if r_field.size else 1.0,
+                    float(np.nanmax(np.abs(offset_field))) if offset_field.size else 1.0,
+                    1.0,
+                ) + 1.0
+                
+                if r_surface == SURFACE_EMPTY:
+                    r_lower = np.full(field.shape, limit, dtype=float)
+                    r_upper = np.full(field.shape, -limit, dtype=float)
+                elif r_surface == SURFACE_SOLID_FILL:
+                    r_lower = np.full(field.shape, -limit, dtype=float)
+                    r_upper = np.full(field.shape, limit, dtype=float)
+                else:
+                    r_lower, r_upper = interval_bounds_for_part(r_field, offset_field, r_part)
+                    if r_lower is None or r_upper is None:
+                        r_lower = np.full(field.shape, limit, dtype=float)
+                        r_upper = np.full(field.shape, -limit, dtype=float)
+                        
+                blended_lower += w_k * r_lower
+                blended_upper += w_k * r_upper
+                
+            blended_material = np.minimum(field - blended_lower, blended_upper - field)
+            
+            # Hierarchical blend: smoothly merge edge result with background
+            # w_edge=1 at edge center (d=0), w_edge=0 at cylinder boundary (d=R)
+            w_edge = 1.0 - u
+            final_material = w_edge * blended_material + (1.0 - w_edge) * bg_material
+            
+            delta = final_material - bg_material
+            App.Console.PrintMessage("[EDGE-DBG] u range in blend: {:.4f} to {:.4f}\n".format(float(np.min(u[blend_mask])), float(np.max(u[blend_mask]))))
+            App.Console.PrintMessage("[EDGE-DBG] w_edge range in blend: {:.4f} to {:.4f}\n".format(float(np.min(w_edge[blend_mask])), float(np.max(w_edge[blend_mask]))))
+            App.Console.PrintMessage("[EDGE-DBG] bg_material in blend: min={:.4f} max={:.4f} mean={:.4f}\n".format(
+                float(np.min(bg_material[blend_mask])), float(np.max(bg_material[blend_mask])), float(np.mean(bg_material[blend_mask]))))
+            App.Console.PrintMessage("[EDGE-DBG] blended_material in blend: min={:.4f} max={:.4f} mean={:.4f}\n".format(
+                float(np.min(blended_material[blend_mask])), float(np.max(blended_material[blend_mask])), float(np.mean(blended_material[blend_mask]))))
+            App.Console.PrintMessage("[EDGE-DBG] final_material in blend: min={:.4f} max={:.4f} mean={:.4f}\n".format(
+                float(np.min(final_material[blend_mask])), float(np.max(final_material[blend_mask])), float(np.mean(final_material[blend_mask]))))
+            App.Console.PrintMessage("[EDGE-DBG] delta (final-bg) in blend: min={:.6f} max={:.6f} absmax={:.6f}\n".format(
+                float(np.min(delta[blend_mask])), float(np.max(delta[blend_mask])), float(np.max(np.abs(delta[blend_mask])))))  
+            App.Console.PrintMessage("[EDGE-DBG] non-zero delta voxels: {} of {}\n".format(
+                int(np.sum(np.abs(delta[blend_mask]) > 1e-10)), int(np.sum(blend_mask))))
+            # Sign change analysis: determines actual mesh geometry changes
+            bg_pos = bg_material[blend_mask] >= 0
+            final_pos = final_material[blend_mask] >= 0
+            pos_to_neg = int(np.sum(bg_pos & ~final_pos))  # solid becomes void
+            neg_to_pos = int(np.sum(~bg_pos & final_pos))  # void becomes solid
+            App.Console.PrintMessage("[EDGE-DBG] SIGN CHANGES: pos->neg (solid->void)={}, neg->pos (void->solid)={}\n".format(pos_to_neg, neg_to_pos))
+            # Count voxels near the zero-crossing in the blend zone
+            near_zero_bg = int(np.sum(np.abs(bg_material[blend_mask]) < 0.1))
+            near_zero_final = int(np.sum(np.abs(final_material[blend_mask]) < 0.1))
+            App.Console.PrintMessage("[EDGE-DBG] voxels near zero-crossing: bg={}, final={}\n".format(near_zero_bg, near_zero_final))
+                
+            material_field[blend_mask] = final_material[blend_mask]
+        except Exception as exc:
+            App.Console.PrintWarning("Failed to apply edge transition in Phase 2: {}\n".format(exc))
 
     grid["surface"] = field.ravel(order="F")
     grid["lower_surface"] = (field + 0.5 * offset_field).ravel(order="F")
@@ -3214,6 +3657,8 @@ def generate_hybrid_freecad_mesh(
     harmonic_boundary_condition=HARMONIC_BOUNDARY_INSULATOR,
     coordinate_mode=COORDINATE_CARTESIAN,
     ring_angular_cells=8,
+    face_transition_specs=None,
+    edge_transition_specs=None,
 ):
     polydata = generate_hybrid_polydata(
         equation,
@@ -3244,6 +3689,8 @@ def generate_hybrid_freecad_mesh(
         harmonic_boundary_condition,
         coordinate_mode,
         ring_angular_cells,
+        face_transition_specs=face_transition_specs,
+        edge_transition_specs=edge_transition_specs,
     )
     return _prepare_freecad_mesh(
         polydata,

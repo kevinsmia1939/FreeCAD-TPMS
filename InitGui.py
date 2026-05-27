@@ -17,12 +17,16 @@ class TPMSGeneratorWorkbench(Workbench):
         import commands.CmdGenerateTPMS
         import commands.CmdAddTPMSRegion
         import commands.CmdAddAllTPMSRegions
+        import commands.CmdAddTPMSTransitionFace
+        import commands.CmdAddTPMSTransitionEdge
         import commands.CmdRefreshTPMS
 
         tool_list = [
             "TPMSGenerator_GenerateUnitCell",
             "TPMSGenerator_AddRegionSettings",
             "TPMSGenerator_AddAllRegionSettings",
+            "TPMSGenerator_AddTransitionFace",
+            "TPMSGenerator_AddTransitionEdge",
             "TPMSGenerator_Refresh",
         ]
         self.appendToolbar("TPMS Generator", tool_list)

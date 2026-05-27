@@ -20,3 +20,6 @@ temp/
 
 # Bundled external reference checkout, if kept locally
 blender-tpms-main/
+ASLI/
+
+implementation_plan.md

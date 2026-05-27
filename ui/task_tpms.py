@@ -131,14 +131,17 @@ class TPMSTaskPanel:
         self.transition_blend_mode.addItems(
             [
                 tpms_generator.TRANSITION_BLEND_THRESHOLD,
-                tpms_generator.TRANSITION_BLEND_SIGNED_FIELD,
                 tpms_generator.TRANSITION_BLEND_SIGMOID,
+                tpms_generator.TRANSITION_BLEND_NORMALIZED_SUM,
             ]
         )
         self.transition_blend_mode.setCurrentText(
             str(getattr(obj, "TransitionBlendMode", tpms_generator.TRANSITION_BLEND_THRESHOLD))
         )
         transition_group.addRow("Blend mode", self.transition_blend_mode)
+
+        self.transition_correction_factor = self._double_spin(float(getattr(obj, "TransitionCorrectionFactor", 0.0)), 0.0, 10.0, 0.05)
+        transition_group.addRow("ASLI Correction", self.transition_correction_factor)
 
         self.transition_source_labyrinth = QtWidgets.QComboBox()
         self.transition_source_labyrinth.addItems(tpms_generator.labyrinth_modes())
@@ -446,7 +449,7 @@ class TPMSTaskPanel:
         self._set_tip(self.transition_topology_mode, "Same-side blends selected labyrinths directly. Cross-labyrinth bridge adds material near the TPMS mid-surface to create a passage.")
         self._set_tip(
             self.transition_blend_mode,
-            "Offset Surface Interpolation blends TPMS part thresholds. Morphological signed-field blends source and target implicit solid fields. Sigmoid blend uses a steeper S-shaped signed-field transition.",
+            "Offset Surface Interpolation blends TPMS part thresholds. Sigmoid blend uses an S-shaped signed-field transition.",
         )
         self._set_tip(self.sampling, "Boundary sampling resolution for tessellated signed-distance clipping. Zero uses TPMS resolution.")
         self._set_tip(self.add_caps, "Adds cap surfaces where TPMS intersects the boundary so the mesh can be closed.")
@@ -711,7 +714,11 @@ class TPMSTaskPanel:
         if boundary_enabled is None:
             boundary_enabled = self.boundary_mode.currentText() == self.generator.BOUNDARY_SELECTED_SOLID
         items = self._region_items() if boundary_enabled else []
-        current = int(getattr(self.obj, "RegionIndex", 0))
+        try:
+            from objects.TPMSUnitCell import _effective_region_index_for_object
+            current = _effective_region_index_for_object(self.obj)
+        except Exception:
+            current = int(getattr(self.obj, "RegionIndex", 0))
         if hasattr(self, "_pending_region_index"):
             current = int(self._pending_region_index)
 
@@ -910,6 +917,7 @@ class TPMSTaskPanel:
             obj.TransitionSourceRegion = self._stored_region_index(self.transition_source.value())
             obj.TransitionTargetRegion = self._stored_region_index(self.transition_target.value())
             obj.TransitionBlendMode = self.transition_blend_mode.currentText()
+            obj.TransitionCorrectionFactor = float(self.transition_correction_factor.value())
             obj.TransitionSourceLabyrinth = self.transition_source_labyrinth.currentText()
             obj.TransitionTargetLabyrinth = self.transition_target_labyrinth.currentText()
             obj.TransitionTopologyMode = self.transition_topology_mode.currentText()
@@ -1098,11 +1106,20 @@ class TPMSTaskPanel:
             if hasattr(self, "_pending_boundary_object"):
                 obj.BoundaryObject = self._pending_boundary_object
             obj.RegionMode = self.region_mode.currentText()
-            obj.RegionIndex = int(self.region_index.currentData() or 0)
+            current_index = int(self.region_index.currentData() or 0)
+            obj.RegionIndex = current_index
+            source_obj = None
+            for item in self._region_items():
+                if int(item["index"]) == current_index:
+                    source_obj = item.get("analytical_object")
+                    break
+            if hasattr(obj, "RegionSourceObject"):
+                obj.RegionSourceObject = source_obj
             obj.RegionRole = self.region_role.currentText()
             obj.TransitionSourceRegion = self._stored_region_index(self.transition_source.value())
             obj.TransitionTargetRegion = self._stored_region_index(self.transition_target.value())
             obj.TransitionBlendMode = self.transition_blend_mode.currentText()
+            obj.TransitionCorrectionFactor = float(self.transition_correction_factor.value())
             obj.TransitionSourceLabyrinth = self.transition_source_labyrinth.currentText()
             obj.TransitionTargetLabyrinth = self.transition_target_labyrinth.currentText()
             obj.TransitionTopologyMode = self.transition_topology_mode.currentText()
