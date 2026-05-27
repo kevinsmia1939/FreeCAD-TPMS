@@ -85,9 +85,14 @@ def surface_names():
 
 
 def evaluate_equation(equation, x, y, z):
-    namespace = dict(SAFE_NAMES)
-    namespace.update({"x": x, "y": y, "z": z})
-    return eval(equation, {"__builtins__": {}}, namespace)
+    try:
+        import numexpr
+        return numexpr.evaluate(equation, local_dict={"x": x, "y": y, "z": z})
+    except Exception:
+        # Fall back to native numpy eval if numexpr is missing or fails
+        namespace = dict(SAFE_NAMES)
+        namespace.update({"x": x, "y": y, "z": z})
+        return eval(equation, {"__builtins__": {}}, namespace)
 
 
 def configure_vtk_smp():
@@ -3200,17 +3205,22 @@ def _map_ring_polydata_to_world(polydata, radius, circumference, origin, rotatio
 
 def polydata_to_freecad_mesh(polydata):
     polydata = polydata.triangulate().clean()
-    faces = np.asarray(polydata.faces)
-    if len(faces) == 0:
+    if polydata.n_cells == 0:
         raise ValueError("Generated TPMS mesh is empty")
-
-    face_matrix = faces.reshape((-1, 4))
-    triangles = face_matrix[face_matrix[:, 0] == 3, 1:4]
-    if len(triangles) == 0:
-        raise ValueError("Generated TPMS mesh has no triangular facets")
-
-    facets = np.asarray(polydata.points, dtype=float)[triangles].tolist()
-    mesh = Mesh.Mesh(facets)
+        
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+        tmp_name = tmp.name
+    try:
+        # Write binary STL using PyVista's extremely fast C++ writer
+        polydata.save(tmp_name, binary=True)
+        # Read using FreeCAD's extremely fast C++ reader
+        mesh = Mesh.Mesh()
+        mesh.read(tmp_name)
+    finally:
+        if os.path.exists(tmp_name):
+            os.remove(tmp_name)
+            
     try:
         mesh.harmonizeNormals()
     except Exception:
